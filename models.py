@@ -35,7 +35,7 @@ def _client() -> ollama.Client:
 @cache
 def cloud_disabled() -> bool:
     """One-time check against the pinned local endpoint: cloud features must be off."""
-    resp = _client().get("/api/status")
+    resp = _client()._client.get("/api/status")  # same pinned, proxy-free client
     resp.raise_for_status()
     return bool(resp.json().get("cloud", {}).get("disabled"))
 
@@ -63,15 +63,15 @@ def complete(
     num_ctx: int = 16384,
     temperature: float = 0.2,
     keep_alive: str = "20m",
+    format: dict | None = None,
 ) -> str:
     _require_local_only()
+    options: dict = {"num_ctx": num_ctx, "temperature": temperature}
+    kwargs: dict = {"options": options, "keep_alive": keep_alive}
+    if format is not None:
+        kwargs["format"] = format  # constrained decoding (structured outputs)
     with _BIG_LOCK:
-        resp = _client().chat(
-            model=model,
-            messages=messages,
-            options={"num_ctx": num_ctx, "temperature": temperature},
-            keep_alive=keep_alive,
-        )
+        resp = _client().chat(model=model, messages=messages, **kwargs)
         return resp["message"]["content"]
 
 
