@@ -6,17 +6,18 @@
 
 ## 开发状态
 
-本 README 描述最终设计，并区分当前代码与后续能力。状态核对日期：2026-10-09；Claude Code 正在并行开发，工作区代码可能尚未提交。
+本 README 描述最终设计，并区分当前代码与后续能力。状态核对日期：2026-10-09，主工作区提交 `69cf48e` 及当时未提交变更；Claude Code 正在并行开发。
 
 | 能力 | 当前状态 | 主要文件 |
 | --- | --- | --- |
 | 配置、数据库 schema、索引切换 | 已有代码和本地自检 | `config.py`、`db.py` |
 | 扫描、去重、解析、切块、embedding、移除/清理 | 工作区已有开发中实现 | `ingest.py`、`parsers.py`、`textutil.py` |
 | Ollama 调用 | 开发中；本地端点与认证头限制尚需加固 | `models.py` |
-| 混合检索、带引用问答、Web UI | 规划中 | `retrieve.py`、`chat.py`、`app.py` |
+| 混合检索、引用问答、Chat/Files UI | 已有实现；模型回答质量与 UI 尚需真实数据验收 | `retrieve.py`、`chat.py`、`app.py` |
 | 图谱抽取、人工确认与纠正 | 已有 schema，业务流程规划中 | `extract.py` |
 | 交易抽取、月度对账、预测 | 已有 schema，业务流程规划中 | `spend.py` |
-| 备份清单、恢复演练、不同维度索引重建 | 规划中，尚非现有 CLI 能力 | 后续 ingest/运维实现 |
+| 备份清单、恢复检查、不同维度重建 | 已有 CLI 和合成测试；完整并发与恢复验收待完成 | `ingest.py`、`db.py` |
+| 本地启动与 cloud-disabled 检查 | 已有实现；客户端继承与监听接口检查待加固 | `run.bat`、`run.ps1` |
 
 自检通过只表示现有合成样本检查通过。环境测量见 [bench.md](bench.md)；凭据检查结果和未关闭问题见 [安全审查记录](docs/security-review.md)。
 
@@ -36,17 +37,17 @@ flowchart LR
         MODEL --> DB
         DB --> STAGE["持久化候选索引\nvec_staging / fts_staging"]
         STAGE --> SWITCH["原子切换 current_run_id"]
-        SWITCH --> LIVE["当前查询集合\nvec_chunks / fts_chunks"]
-        UI["Streamlit UI · 规划中"] -.-> RET["向量 + 关键词 + 图谱\nRRF 融合 · 规划中"]
-        LIVE -.-> RET
-        DB -.-> RET
-        RET -.-> ANSWER["带引用的回答\n证据不足 / 来源冲突"]
-        MODEL -.-> ANSWER
-        ANSWER -.-> UI
+        SWITCH --> LIVE["当前查询集合\nvec_chunks_N / fts_chunks"]
+        UI["Streamlit Chat / Files UI"] --> RET["向量 + 关键词 + 图谱扩展\nRRF 融合"]
+        LIVE --> RET
+        DB --> RET
+        RET --> ANSWER["带引用的回答\n证据不足 / 来源冲突"]
+        MODEL --> ANSWER
+        ANSWER --> UI
         DB -.-> SPEND["人工复核 + SQL 对账\n支出与周期分析 · 规划中"]
         SPEND -.-> UI
-        DB -.-> BACKUP["一致数据库快照 + blob manifest\n备份与恢复 · 规划中"]
-        BLOB -.-> BACKUP
+        DB --> BACKUP["数据库快照 + blob manifest\n备份与恢复检查"]
+        BLOB --> BACKUP
     end
 ```
 
@@ -78,7 +79,7 @@ erDiagram
 - **位置证据**：chunk 保存页码/文本范围、工作表/行范围、段落范围或 OCR 区域。内部 PDF 页号当前从 0 开始，UI 应转换为用户页号。
 - **人工判断**：同名只产生合并候选；引用存在与关系正确分别判断。人工纠正作为查询/展示覆盖层，不被重新抽取覆盖。
 
-图谱与交易归属于 run，最终查询和统计都限制到当前有效 run。embedding 维度改变需要独立的 generation 向量表和安全切换；当前固定维度表尚未实现此项重建能力。
+图谱与交易归属于 run，最终查询和统计都限制到当前有效 run。当前向量表按维度命名：`vec_chunks_N` / `vec_staging_N`；配置 generation 另由 `index_meta` 记录。重建逐文件切换；如果当前引用混合 generation，检索会拒绝执行，不代表全库重建具备不中断查询的原子切换。
 
 ## 导入、切换与删除
 
@@ -116,15 +117,15 @@ sequenceDiagram
 2. A、B 共享旧 run 时，A 更新不能影响 B；最后一个有效引用移除时，旧 run 立即退出查询，无需等待 GC。
 3. `remove` 移除来源；`purge` 删除内容和索引，拒绝仍被有效引用或正在构建的内容。
 4. NAS 离线/源文件消失时保留快照与索引。当前数据库以 `status != 'removed'` 定义有效来源；有旧 `current_run_id` 的失败/缺失来源仍可查询。
-5. GC、构建和备份必须协调。现有数据库事务不等于已完成跨整个构建/备份周期的协调。
+5. GC、构建和备份必须协调。当前默认备份目录有 `backup.lock`；自定义备份目录与完整构建周期的并发协调仍需加固。
 
 当前 blob 路径是 `data/blob/<sha256>.<ext>`，与计划中的目录布局略有不同；数据库保存实际 blob 路径。
 
-## 检索、图谱与支出（规划）
+## 检索、图谱与支出
 
 问答路径：query embedding → 当前向量 top-30 + 分词后全文 top-20 + 实体/别名匹配 → 最多两跳的已确认关系扩展 → RRF 融合 → 上下文预算内的证据 → 本地模型生成答案和引用。
 
-图谱扩展仅使用当前有效 run 的已确认关系。文档中的指令是待引用的数据，回答模型不应获得执行命令、上传文件等工具。证据不足时说明不足，来源冲突时列出双方依据。
+图谱扩展实现已存在，关系抽取与人工确认流程尚待 Phase 2。关系遍历限制到当前有效 run 的已确认关系；所有候选还需保证在融合前处于当前查询集合。文档中的指令是待引用的数据，当前回答模型不获得执行命令或上传工具。证据不足与来源冲突是回答要求，实际模型遵从程度需单独评测。
 
 支出分析先对账，再预测：整数金额加币种 scale；区分消费、退款、转账与信用卡还款；发票/流水中的同一交易经人工确认去重。汇总和预测由 SQL/代码计算，模型只解释。商品补货周期需要数量、单位与明细，安排在后续阶段。
 
@@ -165,7 +166,7 @@ Remove-Item Env:OLLAMA_API_KEY -ErrorAction SilentlyContinue
 ollama serve
 ```
 
-运行 ingest 的另一个终端也要设置本地 `OLLAMA_HOST`、`NO_PROXY`，并移除继承的 `OLLAMA_API_KEY`。这些措施不替代代码层限制。`run.bat` 与 Streamlit 启动器尚未存在。
+运行 ingest 的另一个终端也要设置本地 `OLLAMA_HOST`、`NO_PROXY`，并移除继承的 `OLLAMA_API_KEY`。这些措施不替代代码层限制。
 
 当前工作区 CLI（开发中）：
 
@@ -174,9 +175,15 @@ ollama serve
 .\.venv\Scripts\python.exe -m ingest status
 .\.venv\Scripts\python.exe -m ingest scan
 .\.venv\Scripts\python.exe -m ingest parse
+.\.venv\Scripts\python.exe -m ingest backup
+.\.venv\Scripts\python.exe -m ingest restore-test
+# 开发中的 Chat / Files UI：
+.\run.bat
 ```
 
-`parse` 重试未成功索引当前内容的文件；`remove <path>`、`purge <sha256>`、`gc` 会修改数据。当前 CLI 初始化调用 embedding 维度探测和模型列表，所以 `status` 也需要本地 Ollama。尚未实现的 `backup`、`restore-test`、`rebuild` 不能作为现有命令使用。
+`parse` 重试未成功索引当前内容的文件；`rebuild` 根据配置重新索引；`remove <path>`、`purge <sha256>`、`gc` 会修改数据。当前 CLI 初始化调用 embedding 维度探测和模型列表，所以 `status` / `restore-test` 也需要本地 Ollama。
+
+`run.bat` 调用 `run.ps1`，设置本地环境并检查 cloud-disabled 状态，然后启动绑定 `127.0.0.1:8501` 的 Streamlit。它可能停止现有 Ollama 实例；检查失败默认拒绝继续，`--skip-check` 会绕过此保护。启动器尚未清除继承的 API key、禁用代理或验证实际监听接口。
 
 ## 凭据与隐私保护
 
