@@ -1,5 +1,6 @@
 """app.py — Streamlit UI: chat with citations, files/ingest control. Launched by run.bat (localhost only)."""
 
+import plotly.express as px
 import streamlit as st
 
 import chat
@@ -7,6 +8,7 @@ import db
 import extract
 import ingest
 import models
+import spend
 from config import Config
 
 st.set_page_config(page_title="Family RAG")
@@ -26,7 +28,7 @@ def resources() -> tuple[Config, object]:
 
 cfg, conn = resources()
 
-tab_chat, tab_files, tab_entities = st.tabs(["Chat", "Files", "Entities"])
+tab_chat, tab_files, tab_entities, tab_spend = st.tabs(["Chat", "Files", "Entities", "Spend"])
 
 with tab_chat:
     st.caption(
@@ -142,5 +144,94 @@ with tab_entities:
             st.rerun()
         if b2.button("No — different people", key=f"no{c['id']}"):
             conn.execute("UPDATE entity_merge_candidates SET status='rejected' WHERE id=?", (c["id"],))
+            conn.commit()
+            st.rerun()
+
+with tab_spend:
+    st.caption(
+        "Reconcile first. Totals are computed in code over extracted transactions — "
+        "refunds subtract, transfers and card payments never count, confirmed duplicates count once."
+    )
+    by_cat = spend.monthly_by_category(conn)
+    if by_cat:
+        import pandas as pd
+
+        df = pd.DataFrame([{**r, "major": r["minor"] / r["scale"]} for r in by_cat])
+        st.plotly_chart(
+            px.bar(df, x="month", y="major", color="category", barmode="stack",
+                   labels={"major": "amount", "month": "month"}, height=380),
+            use_container_width=True,
+        )
+        fc = pd.DataFrame(spend.forecast(conn, months_ahead=3))
+        if not fc.empty:
+            st.plotly_chart(
+                px.line(fc, x="month", y=["moving_average", "trend"],
+                        labels={"value": "forecast", "variable": "method"}, height=300),
+                use_container_width=True,
+            )
+            st.caption("Forecast: 3-month moving average vs linear trend — computed, not model-generated.")
+    else:
+        st.info("No transactions yet — run `python -m ingest extract` after indexing bills.")
+
+    st.subheader("Recurring payments (median inter-arrival, computed)")
+    rec = spend.detect_recurring(conn, apply=False)
+    st.dataframe(rec, use_container_width=True)
+
+    st.subheader("Duplicate review — same transaction in an invoice AND a bank statement")
+    pairs = spend.propose_dedup(conn)
+    if not pairs:
+        st.caption("No candidates.")
+    for p in pairs:
+        st.markdown(
+            f"txn {p['a']} and {p['b']}: {p['merchant']} — {p['amount_minor'] / p['scale']:.2f} {p['currency']}. Same purchase?"
+        )
+        b1, b2 = st.columns(2)
+        if b1.button("Yes — keep once", key=f"dup_yes{p['a']}_{p['b']}"):
+            conn.execute("UPDATE txn_links SET status='confirmed' WHERE a=? AND b=?", (p["a"], p["b"]))
+            conn.commit()
+            st.rerun()
+        if b2.button("No — both are real", key=f"dup_no{p['a']}_{p['b']}"):
+            conn.execute("UPDATE txn_links SET status='rejected' WHERE a=? AND b=?", (p["a"], p["b"]))
+            conn.commit()
+            st.rerun()
+
+    st.subheader("Reconciliation — check a month against a known statement total")
+    scales = {"USD": 100, "CNY": 100, "GBP": 100, "EUR": 100, "JPY": 1}
+    with st.form("reconcile"):
+        month = st.text_input("Month (YYYY-MM)", value="2026-08")
+        currency = st.selectbox("Currency", list(scales))
+        expected = st.number_input("Statement total (major units)", min_value=0.0, step=1.0)
+        if st.form_submit_button("Reconcile"):
+            result = spend.reconcile(conn, month, round(expected * scales[currency]), currency)
+            st.info(result["explanation"])
+
+    st.subheader("Review and edit transactions")
+    txns = conn.execute(
+        "SELECT id, date, merchant, category, kind, amount_minor, scale, currency, is_recurring, recurrence "
+        "FROM transactions ORDER BY date"
+    ).fetchall()
+    if txns:
+        edited = st.data_editor(
+            [dict(t) for t in txns],
+            column_config={
+                "id": st.column_config.NumberColumn(disabled=True),
+                "date": st.column_config.TextColumn(disabled=True),
+                "amount_minor": st.column_config.NumberColumn(disabled=True),
+                "scale": st.column_config.NumberColumn(disabled=True),
+                "currency": st.column_config.TextColumn(disabled=True),
+                "is_recurring": st.column_config.NumberColumn(disabled=True),
+                "recurrence": st.column_config.TextColumn(disabled=True),
+            },
+            use_container_width=True,
+        )
+        if st.button("Save edits"):
+            by_id = {t["id"]: t for t in txns}
+            for row in edited:
+                orig = by_id[row["id"]]
+                if (row["merchant"], row["category"], row["kind"]) != (orig["merchant"], orig["category"], orig["kind"]):
+                    conn.execute(
+                        "UPDATE transactions SET merchant=?, category=?, kind=? WHERE id=?",
+                        (row["merchant"], row["category"], row["kind"], row["id"]),
+                    )
             conn.commit()
             st.rerun()
