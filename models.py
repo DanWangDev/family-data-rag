@@ -1,19 +1,53 @@
 """models.py — Ollama client with app-level serial dispatch for big models.
 
-Policy (plan v3): embeddings stay resident; ONE big model at a time. The lock here is
-the real serialization — OLLAMA_MAX_LOADED_MODELS is only a backstop in run.bat.
+Security contract (docs/security-review.md item 1):
+- the client is pinned to http://127.0.0.1:11434 (env OLLAMA_HOST is never read),
+- env proxies are disabled (trust_env=False),
+- the SDK attaches OLLAMA_API_KEY as a Bearer header even when host+headers are passed
+  explicitly (verified 2026-10-09); we drop the inherited key before construction and
+  REFUSE to use a client that still carries an Authorization header,
+- every network call requires the server to report cloud features disabled.
 """
 
+import os
 import threading
 from functools import cache
 
 import ollama
 
+LOCAL_ENDPOINT = "http://127.0.0.1:11434"
+
 _BIG_LOCK = threading.Lock()
 
 
+def _client() -> ollama.Client:
+    os.environ.pop("OLLAMA_API_KEY", None)
+    client = ollama.Client(
+        host=LOCAL_ENDPOINT,
+        trust_env=False,
+        headers={"Accept": "application/json", "Content-Type": "application/json"},
+    )
+    if any("authorization" in k.lower() for k in client._client.headers):
+        raise RuntimeError("refusing to use an ollama client with an inherited Authorization header")
+    return client
+
+
+@cache
+def cloud_disabled() -> bool:
+    """One-time check against the pinned local endpoint: cloud features must be off."""
+    resp = _client().get("/api/status")
+    resp.raise_for_status()
+    return bool(resp.json().get("cloud", {}).get("disabled"))
+
+
+def _require_local_only() -> None:
+    if not cloud_disabled():
+        raise RuntimeError("ollama reports cloud features enabled — refusing (OLLAMA_NO_CLOUD=1 required)")
+
+
 def embed_batch(model: str, texts: list[str]) -> list[list[float]]:
-    resp = ollama.embed(model=model, input=texts, keep_alive="100000h")  # resident; bare "-1" no longer parses
+    _require_local_only()
+    resp = _client().embed(model=model, input=texts, keep_alive="100000h")  # resident; bare "-1" no longer parses
     return [list(e) for e in resp["embeddings"]]
 
 
@@ -30,8 +64,9 @@ def complete(
     temperature: float = 0.2,
     keep_alive: str = "20m",
 ) -> str:
+    _require_local_only()
     with _BIG_LOCK:
-        resp = ollama.chat(
+        resp = _client().chat(
             model=model,
             messages=messages,
             options={"num_ctx": num_ctx, "temperature": temperature},
@@ -43,7 +78,8 @@ def complete(
 @cache
 def model_digest(model: str) -> str:
     """Digest of the locally installed model, for index_meta provenance."""
-    for m in ollama.list()["models"]:
+    _require_local_only()
+    for m in _client().list()["models"]:
         try:
             name = m["model"]
         except KeyError:
