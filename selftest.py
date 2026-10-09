@@ -98,7 +98,7 @@ def check_db_switch_contract() -> None:
             )
             cid = cur.lastrowid
             conn.execute(
-                "INSERT INTO vec_staging(rowid, embedding) VALUES(?,?)",
+                "INSERT INTO vec_staging_4(rowid, embedding) VALUES(?,?)",
                 (cid, json.dumps([0.1, 0.2, 0.3, 0.4])),
             )
             conn.execute("INSERT INTO fts_staging(rowid, text) VALUES(?,?)", (cid, f"chunk {base + i}"))
@@ -106,7 +106,7 @@ def check_db_switch_contract() -> None:
 
     def live_counts() -> tuple[int, int]:
         return (
-            conn.execute("SELECT COUNT(*) FROM vec_chunks").fetchone()[0],
+            conn.execute("SELECT COUNT(*) FROM vec_chunks_4").fetchone()[0],
             conn.execute("SELECT COUNT(*) FROM fts_chunks").fetchone()[0],
         )
 
@@ -127,11 +127,11 @@ def check_db_switch_contract() -> None:
     db.switch_run(conn, a, r2)  # A updates; R1 must stay live for B
     assert live_counts() == (4, 4)
 
-    # scenario 4 (failed switch): FK error -> transaction rolls back, old index intact
+    # scenario 4 (failed switch): nonexistent run -> refused up front, old index intact
     try:
         db.switch_run(conn, a, 9999)
         raise AssertionError("switch to nonexistent run should raise")
-    except sqlite3.IntegrityError:
+    except ValueError:
         pass
     assert conn.execute("SELECT current_run_id FROM files WHERE id=?", (a,)).fetchone()[0] == r2
     assert live_counts() == (4, 4)
@@ -159,11 +159,283 @@ def check_db_switch_contract() -> None:
         raise AssertionError("purge of a referenced version should raise")
     except ValueError:
         pass
-    db.remove_file(conn, c)
-    # removed files keep their pointer as audit trail; GC clears their rows first, then purge proceeds
-    conn.execute("DELETE FROM files WHERE status='removed'")
+    db.remove_file(conn, c)  # removed rows are audit trail, not blockers
+    db.purge_version(conn, v2)  # clears removed rows, runs, version in one transaction
+
+
+def check_ingest_flow() -> None:
+    """CI scenarios 1-3 + idempotence + rename dedup + re-promotion + remove/purge/gc at the ingest layer."""
+    import tempfile
+    from pathlib import Path
+
+    import config
+    import db
+    import ingest
+
+    fake_cfg = dict(
+        max_file_mb=100,
+        photo_captions=False,
+        models=config.Models(chat="qwen3:14b", extract="qwen3:8b", embed="fake-embed", vision="qwen3-vl:8b"),
+    )
+    fake_embed = lambda model, texts: [[0.25] * 4 for _ in texts]
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        src = root / "src"
+        src.mkdir()
+        cfg = config.Config(source_dirs=(src,), db_path=root / "family.db", blob_dir=root / "blob", **fake_cfg)
+        conn = db.connect(str(cfg.db_path))
+        db.init_db(conn, dims=4, embed_model="fake-embed", embed_digest="deadbeef")
+
+        versions = lambda: conn.execute("SELECT COUNT(*) FROM file_versions").fetchone()[0]
+        runs = lambda: conn.execute("SELECT COUNT(*) FROM index_runs").fetchone()[0]
+        live_by_run = lambda: {
+            r["run_id"]: r["n"]
+            for r in conn.execute(
+                "SELECT c.run_id, COUNT(*) AS n FROM vec_chunks_4 v JOIN chunks c ON c.id = v.rowid GROUP BY c.run_id"
+            )
+        }
+
+        def write(name: str, content: str) -> None:
+            (src / name).write_text(content, encoding="utf-8")
+
+        def scan() -> None:
+            ingest.scan(conn, cfg, embed_fn=fake_embed, dims=4, digest="deadbeef")
+
+        # identical A and B -> one version, one run, both queryable
+        write("a.txt", "alpha " * 200)
+        write("b.txt", "alpha " * 200)
+        scan()
+        assert versions() == 1 and runs() == 1, f"v={versions()} r={runs()}"
+        r_v1 = next(iter(live_by_run()))
+        assert live_by_run() == {r_v1: 2}
+
+        # duplicate import idempotence
+        scan()
+        assert versions() == 1 and runs() == 1 and live_by_run() == {r_v1: 2}
+
+        # scenario 1: A changes -> B still queryable on V1
+        write("a.txt", "beta " * 200)
+        scan()
+        assert versions() == 2 and runs() == 2
+        r_v2 = [r for r in live_by_run() if r != r_v1][0]
+        assert set(live_by_run()) == {r_v1, r_v2}
+        n_v1 = live_by_run()[r_v1]
+        assert live_by_run()[r_v2] > 0
+
+        # scenario 2: B also changes -> V1 evicted immediately, before any GC
+        write("b.txt", "gamma " * 200)
+        scan()
+        assert versions() == 3 and runs() == 3
+        r_v3 = [r for r in live_by_run() if r not in (r_v1, r_v2)][0]
+        assert set(live_by_run()) == {r_v2, r_v3}
+
+        # rename with identical content -> no new version/run (dedup by content, not path)
+        write("c.txt", "gamma " * 200)
+        scan()
+        assert versions() == 3 and runs() == 3
+
+        # re-promotion: A returns to V1's content -> durable staging rows go live again,
+        # no re-embed; A's old run (V2) loses its last reference and is evicted in the same switch
+        write("a.txt", "alpha " * 200)
+        scan()
+        assert versions() == 3 and runs() == 3
+        assert set(live_by_run()) == {r_v1, r_v3}
+        assert live_by_run()[r_v1] == n_v1
+
+        # remove a source: its run evicts only when it loses its last valid reference
+        write("d.txt", "delta " * 200)
+        scan()
+        assert versions() == 4 and runs() == 4
+        r_v4 = [r for r in live_by_run() if r not in (r_v1, r_v3)][0]
+        ingest.remove_source(conn, str(src / "d.txt"))
+        assert live_by_run() == {r_v1: 2, r_v3: 2}
+
+        # purge content: removed rows are audit trail, not blockers -> succeeds immediately
+        sha_d = conn.execute(
+            "SELECT v.sha256 FROM file_versions v JOIN files f ON f.current_version_id=v.id WHERE f.source_path=?",
+            (str(src / "d.txt"),),
+        ).fetchone()[0]
+        ingest.purge_content(conn, cfg.blob_dir, sha_d)
+        assert versions() == 3 and runs() == 3
+        assert live_by_run() == {r_v1: 2, r_v3: 2}
+
+        # gc: collects orphan run V2 (A moved back to V1) and the removed-file version V5
+        write("e.txt", "epsilon " * 200)
+        scan()
+        assert versions() == 4
+        ingest.remove_source(conn, str(src / "e.txt"))
+        removed_blobs = ingest.gc(conn, cfg.blob_dir)
+        assert removed_blobs == 2  # V2's blob + e's blob
+        assert versions() == 2 and runs() == 2
+        assert live_by_run() == {r_v1: 2, r_v3: 2}
+
+        # scenario 4 (generation reindex): same content under a new generation —
+        # embedding-only change reuses chunks; old index stays live until each switch
+        fake5 = lambda model, texts: [[0.25] * 5 for _ in texts]
+        ingest.rebuild(conn, cfg, embed_fn=fake5, dims=5, digest="other-digest")
+        new_runs = [
+            r["run_id"]
+            for r in conn.execute("SELECT DISTINCT c.run_id FROM vec_chunks_5 v JOIN chunks c ON c.id = v.rowid")
+        ]
+        assert len(new_runs) == 2  # a (V1) + b/c sharing one V3 run
+        assert not live_by_run()  # old generation evicted from vec_chunks_4
+        for nr in new_runs:
+            assert conn.execute("SELECT chunk_count FROM index_runs WHERE id=?", (nr,)).fetchone()["chunk_count"] == 2
+
+        # failed rebuild keeps the old index live
+        def failing_embed(model, texts):
+            raise RuntimeError("simulated embed outage")
+
+        ingest.rebuild(conn, cfg, embed_fn=failing_embed, dims=6, digest="broken-digest")
+        still = [
+            r["run_id"]
+            for r in conn.execute("SELECT DISTINCT c.run_id FROM vec_chunks_5 v JOIN chunks c ON c.id = v.rowid")
+        ]
+        assert still == new_runs
+
+        # missing share: scan logs and continues, nothing is deleted
+        cfg2 = config.Config(source_dirs=(root / "nonexistent",), db_path=root / "family.db",
+                             blob_dir=root / "blob", **fake_cfg)
+        ingest.scan(conn, cfg2, embed_fn=fake_embed, dims=4, digest="deadbeef")
+        assert conn.execute(
+            "SELECT status FROM sources WHERE path=?", (str(root / "nonexistent"),)
+        ).fetchone()[0] == "missing_on_share"
+        # untouched: the new generation's live vectors (2 chunks per run, 2 runs)
+        assert conn.execute("SELECT COUNT(*) FROM vec_chunks_5").fetchone()[0] == 4
+        conn.close()
+
+
+def check_retrieve_and_chat() -> None:
+    """RRF math, hybrid retrieval with citations, generation refusal, prompt contract — model-free."""
+    import json
+    from pathlib import Path
+
+    import chat
+    import config
+    import db
+    import retrieve
+
+    # RRF ordering on a fixed small input (scores: 2 > 3 > 1 > 4)
+    assert retrieve.rrf([[1, 2, 3], [2, 3, 4]]) == [2, 3, 1, 4]
+
+    cfg = config.Config(
+        source_dirs=(), db_path="unused", blob_dir=Path("unused"),
+        max_file_mb=100, photo_captions=False,
+        models=config.Models(chat="qwen3:14b", extract="qwen3:8b", embed="fake-embed", vision="qwen3-vl:8b"),
+    )
+    fake_embed = lambda model, texts: [[0.25] * 4 for _ in texts]
+
+    conn = db.connect(":memory:")
+    gen = db.init_db(conn, dims=4, embed_model="fake-embed", embed_digest="deadbeef")
+    cur = conn.execute("INSERT INTO file_versions(sha256, size_bytes, blob_path) VALUES(?, 10, 'blob/x')", ("a" * 64,))
+    version_id = cur.lastrowid
+    cur = conn.execute("INSERT INTO index_runs(version_id, generation_id, state) VALUES(?,?, 'embedded')", (version_id, gen))
+    run_id = cur.lastrowid
+    cur = conn.execute(
+        "INSERT INTO files(source_path, name, kind, ext, current_version_id, current_run_id, status) "
+        "VALUES('src/bills.txt', 'bills.txt', 'txt', 'txt', ?, ?, 'embedded')",
+        (version_id, run_id),
+    )
     conn.commit()
-    db.purge_version(conn, v2)
+
+    texts = ["electricity bill for the house in March", "shopping list for groceries"]
+    chunk_ids: list[int] = []
+    for seq, text in enumerate(texts):
+        cur = conn.execute("INSERT INTO chunks(run_id, seq, text, page, kind) VALUES(?,?,?,?, 'body')", (run_id, seq, text, seq + 1))
+        cid = cur.lastrowid
+        chunk_ids.append(cid)
+        conn.execute("INSERT INTO vec_chunks_4(rowid, embedding) VALUES(?,?)", (cid, json.dumps([0.25] * 4)))
+        conn.execute("INSERT INTO fts_chunks(rowid, text) VALUES(?,?)", (cid, "electricity bill house march" if seq == 0 else "shopping list groceries"))
+    conn.commit()
+
+    hits = retrieve.retrieve(conn, cfg, "electricity bill", embed_fn=fake_embed, dims=4, digest="deadbeef")
+    assert hits, "retrieval returned nothing"
+    assert hits[0]["id"] == chunk_ids[0], f"fts/vec should rank the bill chunk first: {hits}"
+    assert hits[0]["source_path"] == "src/bills.txt" and hits[0]["name"] == "bills.txt"
+
+    # generation mismatch -> refusal
+    try:
+        retrieve.retrieve(conn, cfg, "x", embed_fn=fake_embed, dims=8, digest="deadbeef")
+        raise AssertionError("retrieval on a mismatched generation should refuse")
+    except RuntimeError:
+        pass
+
+    # prompt contract: citations present; document content is data, not instructions
+    msgs = chat.build_prompt("what is the bill?", hits)
+    assert "DATA" in msgs[0]["content"] and "instructions" in msgs[0]["content"]
+    assert "[1]" in msgs[1]["content"] and "bills.txt" in msgs[1]["content"]
+
+    # empty-result guard: no chunks -> refusal message, no model call
+    real_retrieve = chat.retrieve.retrieve
+    chat.retrieve.retrieve = lambda conn, cfg, q, **kw: []
+    try:
+        empty = chat.ask(conn, cfg, "anything", embed_fn=fake_embed, dims=4, digest="deadbeef")
+    finally:
+        chat.retrieve.retrieve = real_retrieve
+    assert empty["sources"] == [] and "No relevant documents" in empty["answer"]
+
+
+def check_backup_restore() -> None:
+    """Backup snapshot + manifest + SHA-verified restore drill; GC refuses during backup."""
+    import tempfile
+    from pathlib import Path
+
+    import config
+    import db
+    import ingest
+
+    fake_cfg = dict(
+        max_file_mb=100,
+        photo_captions=False,
+        models=config.Models(chat="qwen3:14b", extract="qwen3:8b", embed="fake-embed", vision="qwen3-vl:8b"),
+    )
+    fake_embed = lambda model, texts: [[0.25] * 4 for _ in texts]
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        src = root / "src"
+        src.mkdir()
+        cfg = config.Config(source_dirs=(src,), db_path=root / "family.db", blob_dir=root / "blob", **fake_cfg)
+        conn = db.connect(str(cfg.db_path))
+        db.init_db(conn, dims=4, embed_model="fake-embed", embed_digest="deadbeef")
+        (src / "a.txt").write_text("alpha " * 200, encoding="utf-8")
+        ingest.scan(conn, cfg, embed_fn=fake_embed, dims=4, digest="deadbeef")
+
+        snap = ingest.backup(conn, cfg.blob_dir)  # dest defaults to blob_dir.parent/backups
+        backups = root / "backups"
+        assert snap.parent == backups and snap.exists()
+        manifests = list(backups.glob("*.manifest.json"))
+        assert len(manifests) == 1
+        manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+        assert manifest["snapshot"] == snap.name
+        assert len(manifest["blobs"]) == 1
+
+        # restore drill passes on a healthy backup
+        assert ingest.restore_test(backups) == []
+
+        # corrupted blob -> flagged
+        blob = backups / "blobs" / manifest["blobs"][0]
+        blob.write_bytes(b"corrupted")
+        problems = ingest.restore_test(backups)
+        assert problems and any("hash mismatch" in p for p in problems)
+
+        # missing blob -> flagged
+        blob.unlink()
+        problems = ingest.restore_test(backups)
+        assert problems and any("missing" in p for p in problems)
+
+        # GC refuses while a backup lock is held
+        lock = backups / "backup.lock"
+        lock.touch()
+        try:
+            ingest.gc(conn, cfg.blob_dir)
+            raise AssertionError("gc should refuse during a backup")
+        except RuntimeError:
+            pass
+        finally:
+            lock.unlink(missing_ok=True)
+        conn.close()
 
 
 def main() -> None:
@@ -171,6 +443,9 @@ def main() -> None:
     check_sqlite_vec_roundtrip()
     check_ocr_roundtrip()
     check_db_switch_contract()
+    check_ingest_flow()
+    check_retrieve_and_chat()
+    check_backup_restore()
     print("selftest: all checks passed")
 
 
