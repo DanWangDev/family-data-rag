@@ -13,7 +13,7 @@ _BIG_LOCK = threading.Lock()
 
 
 def embed_batch(model: str, texts: list[str]) -> list[list[float]]:
-    resp = ollama.embed(model=model, input=texts, keep_alive="-1")  # embeddings resident
+    resp = ollama.embed(model=model, input=texts, keep_alive="100000h")  # resident; bare "-1" no longer parses
     return [list(e) for e in resp["embeddings"]]
 
 
@@ -44,6 +44,10 @@ def complete(
 def model_digest(model: str) -> str:
     """Digest of the locally installed model, for index_meta provenance."""
     for m in ollama.list()["models"]:
-        if m["model"] == model or m["name"] == model:
+        try:
+            name = m["model"]
+        except KeyError:
+            name = m["name"]
+        if name == model or name.rsplit(":", 1)[0] == model:  # list names carry :latest tags
             return m["digest"].split(":")[0]
     raise ValueError(f"model not installed: {model}")

@@ -1,6 +1,6 @@
 """ingest.py — scan sources, blob store, versioned indexing, lifecycle CLI.
 
-python -m ingest scan|parse|status|remove <path>|purge <sha>|gc
+python -m ingest scan|parse|status|remove <path>|purge <sha>|gc|backup|restore-test [dir]
 """
 
 import argparse
@@ -8,6 +8,7 @@ import hashlib
 import json
 import re
 import shutil
+import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -105,6 +106,7 @@ def _insert_chunks(
     conn, run_id: int, texts: list[str], pages: list[int | None],
     kinds: list[str], positions: list[str | None], embs: list[list[float]],
 ) -> None:
+    _, staging = db.run_vec_names(conn, run_id)
     conn.execute("BEGIN IMMEDIATE")
     try:
         for seq, (text, page, kind, pos, emb) in enumerate(zip(texts, pages, kinds, positions, embs)):
@@ -113,7 +115,7 @@ def _insert_chunks(
                 (run_id, seq, text, page, kind, pos),
             )
             cid = cur.lastrowid
-            conn.execute("INSERT INTO vec_staging(rowid, embedding) VALUES(?,?)", (cid, json.dumps(emb)))
+            conn.execute(f"INSERT INTO {staging}(rowid, embedding) VALUES(?,?)", (cid, json.dumps(emb)))
             conn.execute("INSERT INTO fts_staging(rowid, text) VALUES(?,?)", (cid, textutil.segment(text)))
         conn.execute("UPDATE index_runs SET chunk_count=?, updated_at=datetime('now') WHERE id=?", (len(texts), run_id))
         conn.commit()
@@ -250,6 +252,81 @@ def _scan_one(conn, cfg: Config, path: Path, stamp: str, embed_fn, dims, digest)
         build_index(conn, cfg, file_id, version_id, embed_fn=embed_fn, dims=dims, digest=digest)
 
 
+def rebuild(conn, cfg: Config, *, embed_fn=None, dims: int | None = None, digest: str | None = None) -> None:
+    """Re-index every file under a NEW generation.
+
+    Two-tiered per plan: embedding-only change reuses existing chunks (re-embed, no
+    re-parse); parser/chunker change re-parses from the blob. Old indexes stay live
+    until each file's switch succeeds.
+    """
+    embed_fn = embed_fn or models.embed_batch
+    if dims is None:
+        dims = models.embed_dims(cfg.models.embed)
+    if digest is None:
+        digest = models.model_digest(cfg.models.embed)
+    db.ensure_vec_tables(conn, dims)  # new dims need their own vec tables
+    gen = db.get_or_create_generation(
+        conn, parser_version=db.PARSER_VERSION, chunk_config=db.CHUNK_CONFIG,
+        embed_model=cfg.models.embed, embed_digest=digest, dims=dims,
+    )
+    for frow in conn.execute(
+        "SELECT id, current_version_id FROM files WHERE current_version_id IS NOT NULL AND status != 'removed'"
+    ):
+        version_id = frow["current_version_id"]
+        cur_run = conn.execute("SELECT current_run_id FROM files WHERE id=?", (frow["id"],)).fetchone()
+        if cur_run and cur_run["current_run_id"]:
+            cur_gen = conn.execute(
+                "SELECT generation_id FROM index_runs WHERE id=?", (cur_run["current_run_id"],)
+            ).fetchone()
+            if cur_gen and cur_gen["generation_id"] == gen:
+                continue  # already on the new generation
+        existing = conn.execute(
+            "SELECT id FROM index_runs WHERE version_id=? AND generation_id=? AND state IN ('embedded', 'extracted', 'extract_failed')",
+            (version_id, gen),
+        ).fetchone()
+        if existing:  # another file already rebuilt this content under the new generation
+            db.switch_run(conn, frow["id"], existing["id"])
+            continue
+        src = conn.execute(
+            """
+            SELECT r.id FROM index_runs r JOIN index_meta m ON m.id = r.generation_id
+            WHERE r.version_id=? AND m.parser_version=? AND m.chunk_config=?
+              AND r.state IN ('embedded', 'extracted', 'extract_failed')
+            ORDER BY r.id DESC LIMIT 1
+            """,
+            (version_id, db.PARSER_VERSION, db.CHUNK_CONFIG),
+        ).fetchone()
+        if not src:
+            build_index(conn, cfg, frow["id"], version_id, embed_fn=embed_fn, dims=dims, digest=digest)
+            continue
+        _rebuild_from_chunks(conn, cfg, frow["id"], version_id, gen, src["id"], embed_fn, dims)
+
+
+def _rebuild_from_chunks(conn, cfg: Config, file_id: int, version_id: int, gen: int,
+                         src_run_id: int, embed_fn, dims: int) -> None:
+    """Embedding-only rebuild: copy chunks from a prior run, re-embed, stage, switch."""
+    cur = conn.execute("INSERT INTO index_runs(version_id, generation_id, state) VALUES(?,?, 'embedding')", (version_id, gen))
+    run_id = cur.lastrowid
+    conn.commit()
+    try:
+        rows = conn.execute("SELECT seq, text, page, kind, position FROM chunks WHERE run_id=? ORDER BY seq", (src_run_id,)).fetchall()
+        if not rows:
+            raise ValueError("source run has no chunks")
+        texts = [r["text"] for r in rows]
+        embs = _embed(embed_fn, cfg.models.embed, texts)
+        if len(embs[0]) != dims:
+            raise ValueError(f"embedding dims mismatch: got {len(embs[0])}, generation expects {dims}")
+        _insert_chunks(
+            conn, run_id, texts,
+            [r["page"] for r in rows], [r["kind"] for r in rows], [r["position"] for r in rows], embs,
+        )
+        db.set_run_state(conn, run_id, "embedded", chunk_count=len(texts))
+        db.switch_run(conn, file_id, run_id)
+    except Exception as e:
+        _log(f"rebuild failed (run {run_id}): {e}")
+        db.set_run_state(conn, run_id, "error")
+
+
 def parse_all(conn, cfg: Config, *, embed_fn=None, dims=None, digest=None) -> None:
     """Retry files whose current content has no successful current run (recovery after failures)."""
     rows = conn.execute(
@@ -283,9 +360,74 @@ def purge_content(conn, blob_dir: Path, sha: str) -> None:
         Path(blob).unlink(missing_ok=True)
 
 
+def backup(conn, blob_dir: Path, dest: Path | None = None) -> Path:
+    """WAL-safe snapshot via the SQLite Backup API + manifest of referenced blobs.
+
+    Blobs copy into dest/blobs only when missing (append to the backup chain); the
+    manifest ties the snapshot to the chain and restore_test verifies every SHA.
+    """
+    dest = dest or (blob_dir.parent / "backups")
+    dest.mkdir(parents=True, exist_ok=True)
+    lock = dest / "backup.lock"
+    try:
+        lock.touch(exist_ok=False)
+    except FileExistsError:
+        raise RuntimeError("a backup is already running")
+    try:
+        snap = dest / f"family-{datetime.now().strftime('%Y%m%d-%H%M%S')}.db"
+        target = sqlite3.connect(snap)
+        conn.backup(target)
+        target.close()
+        blob_store = dest / "blobs"
+        blob_store.mkdir(exist_ok=True)
+        manifest = {"snapshot": snap.name, "blobs": []}
+        for b in conn.execute("SELECT blob_path FROM file_versions"):
+            src = Path(b["blob_path"])
+            dst = blob_store / src.name
+            if not dst.exists():
+                shutil.copy2(src, dst)
+            manifest["blobs"].append(src.name)
+        (dest / f"{snap.name}.manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        return snap
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+def restore_test(backup_dir: Path) -> list[str]:
+    """Verify the newest snapshot: DB opens, index tables readable, every manifest blob
+    present with matching SHA. Empty list = restore would work."""
+    problems: list[str] = []
+    manifests = sorted(backup_dir.glob("*.manifest.json"))
+    if not manifests:
+        return ["no manifest found"]
+    manifest = json.loads(manifests[-1].read_text(encoding="utf-8"))
+    snap = backup_dir / manifest["snapshot"]
+    if not snap.exists():
+        return [f"snapshot missing: {snap}"]
+    try:
+        rconn = sqlite3.connect(f"file:{snap}?mode=ro", uri=True)
+        for table in ("files", "file_versions", "index_runs", "chunks"):
+            rconn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+        rconn.close()
+    except Exception as e:
+        problems.append(f"snapshot unreadable: {e}")
+    for name in manifest["blobs"]:
+        p = backup_dir / "blobs" / name
+        if not p.exists():
+            problems.append(f"blob missing: {name}")
+            continue
+        if sha256_of(p) != name.split(".")[0]:
+            problems.append(f"blob hash mismatch: {name}")
+    return problems
+
+
 def gc(conn, blob_dir: Path) -> int:
     """Collect unreferenced runs/versions/chunks/blobs. Terminal-state runs only; the
     BEGIN IMMEDIATE lock keeps this out of concurrent switches, backups, and builds."""
+    # ponytail: gc only checks the DEFAULT backups dir for an open backup lock; a
+    # custom backup dest bypasses the check — share one dest until this matters.
+    if (blob_dir.parent / "backups" / "backup.lock").exists():
+        raise RuntimeError("a backup is running — GC refused")
     conn.execute("BEGIN IMMEDIATE")
     try:
         # removed rows become tombstones: pointers cleared so orphan detection can collect
@@ -336,11 +478,18 @@ def gc(conn, blob_dir: Path) -> int:
 def status(conn) -> None:
     for row in conn.execute("SELECT status, COUNT(*) AS n FROM files GROUP BY status ORDER BY status"):
         print(f"files {row['status']}: {row['n']}")
+    vec_live = sum(
+        conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]
+        for (name,) in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name GLOB 'vec_chunks_[0-9]*' AND name NOT GLOB 'vec_chunks_[0-9]*_*'"
+        )
+    )
     for label, sql in (
         ("versions", "SELECT COUNT(*) FROM file_versions"),
         ("runs", "SELECT COUNT(*) FROM index_runs"),
         ("chunks", "SELECT COUNT(*) FROM chunks"),
-        ("live vectors", "SELECT COUNT(*) FROM vec_chunks"),
+        ("live vectors", f"SELECT {vec_live}"),
     ):
         print(f"{label}: {conn.execute(sql).fetchone()[0]}")
 
@@ -356,6 +505,10 @@ def main(argv=None) -> None:
     pu = sub.add_parser("purge")
     pu.add_argument("sha256")
     sub.add_parser("gc")
+    sub.add_parser("backup")
+    sub.add_parser("rebuild")
+    rt = sub.add_parser("restore-test")
+    rt.add_argument("backup_dir", nargs="?")
     args = p.parse_args(argv)
 
     cfg = Config.load()
@@ -377,6 +530,18 @@ def main(argv=None) -> None:
         purge_content(conn, cfg.blob_dir, args.sha256)
     elif args.cmd == "gc":
         print(f"gc: removed {gc(conn, cfg.blob_dir)} blobs")
+    elif args.cmd == "backup":
+        print(f"backup: {backup(conn, cfg.blob_dir)}")
+    elif args.cmd == "rebuild":
+        rebuild(conn, cfg)
+    elif args.cmd == "restore-test":
+        dest = Path(args.backup_dir) if args.backup_dir else cfg.blob_dir.parent / "backups"
+        problems = restore_test(dest)
+        if problems:
+            for prob in problems:
+                _log(f"restore problem: {prob}")
+        else:
+            print("restore-test: OK")
 
 
 if __name__ == "__main__":

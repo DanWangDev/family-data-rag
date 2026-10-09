@@ -15,12 +15,12 @@ FTS_K = 20
 TOP = 12
 
 
-def _vec_search(conn, embed_fn, model: str, query: str, k: int = VEC_K) -> list[int]:
+def _vec_search(conn, embed_fn, model: str, query: str, table: str, k: int = VEC_K) -> list[int]:
     q = embed_fn(model, [query])[0]
     return [
         r["rowid"]
         for r in conn.execute(
-            "SELECT rowid, distance FROM vec_chunks WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
+            f"SELECT rowid, distance FROM {table} WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
             (json.dumps(q), k),
         )
     ]
@@ -121,7 +121,8 @@ def retrieve(conn, cfg, query: str, *, embed_fn=None, top: int = TOP, dims: int 
     query = query.strip()
     if not query:
         return []
-    vec_hits = _vec_search(conn, embed_fn, cfg.models.embed, query)
+    live_table = db.vec_names(dims if dims is not None else models.embed_dims(cfg.models.embed))[0]
+    vec_hits = _vec_search(conn, embed_fn, cfg.models.embed, query, live_table)
     ranked = [
         vec_hits,
         _fts_search(conn, query),
