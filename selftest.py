@@ -646,6 +646,68 @@ def check_extract() -> None:
         conn.close()
 
 
+def check_spend() -> None:
+    """Phase 3 reconciliation math: kind exclusion, refund subtraction, duplicate
+    exclusion after confirmation, cadence classes, forecast, deterministic explanations."""
+    import db
+    import spend
+
+    conn = db.connect(":memory:")
+    conn.executescript(db.SCHEMA)
+    conn.execute("INSERT INTO files(id, source_path, name, kind) VALUES(1, 'inv', 'inv', 'csv')")
+    conn.execute("INSERT INTO files(id, source_path, name, kind) VALUES(2, 'stmt', 'stmt', 'csv')")
+    conn.commit()
+
+    def add(date, minor, scale=100, currency="USD", merchant="", category="", kind="consumption", file_id=None):
+        cur = conn.execute(
+            "INSERT INTO transactions(file_id, date, amount_minor, scale, currency, merchant, category, kind) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (file_id, date, minor, scale, currency, merchant, category, kind),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+    # January: consumption 10000, refund 2000; transfer + card payment excluded
+    add("2026-01-05", 10000, category="utilities")
+    add("2026-01-20", 2000, category="utilities", kind="refund")
+    add("2026-01-15", 5000, kind="transfer")
+    add("2026-01-25", 3000, kind="credit_card_payment")
+    for d in ("2026-02-05", "2026-03-05", "2026-04-05"):
+        add(d, 11000 + 1000 * int(d[5:7]) % 3000, category="utilities")
+    for d in ("2026-01-01", "2026-02-01", "2026-03-01"):
+        add(d, 1550, merchant="Netflix", category="subscriptions")
+    add("2025-03-01", 186000, merchant="SafeHome", category="insurance")
+    add("2026-03-01", 186000, merchant="SafeHome", category="insurance")
+    a1 = add("2026-03-10", 4000, merchant="Grocery Mart", category="groceries", file_id=1)
+    a2 = add("2026-03-11", 4000, merchant="Grocery Mart", category="groceries", file_id=2)
+
+    jan = next(t for t in spend.month_totals(conn) if t["month"] == "2026-01")
+    # 10000 (utilities) - 2000 (refund) + 1550 (netflix); transfer/card excluded
+    assert jan["minor"] == 9550 and jan["n"] == 3
+
+    rec = {r["merchant"]: r for r in spend.detect_recurring(conn)}
+    assert rec["netflix"]["cadence"] == "monthly" and rec["netflix"]["count"] == 3
+    assert rec["safehome"]["cadence"] == "annual"
+
+    pairs = spend.propose_dedup(conn)
+    assert {(p["a"], p["b"]) for p in pairs} == {(a1, a2)}
+    mar_before = next(t for t in spend.month_totals(conn) if t["month"] == "2026-03")
+    # pending duplicate still counted, and reconciliation says so
+    res = spend.reconcile(conn, "2026-03", mar_before["minor"] + 300)
+    assert res["difference_minor"] == 300
+    assert "possible duplicate" in res["explanation"]
+    # confirmed duplicate: excluded from totals and reconciliation matches
+    conn.execute("UPDATE txn_links SET status='confirmed'")
+    conn.commit()
+    mar_after = next(t for t in spend.month_totals(conn) if t["month"] == "2026-03")
+    assert mar_before["minor"] - mar_after["minor"] == 4000
+    res2 = spend.reconcile(conn, "2026-03", mar_after["minor"])
+    assert res2["difference_minor"] == 0 and res2["explanation"] == "totals match"
+
+    fc = spend.forecast(conn, months_ahead=3)
+    assert len(fc) == 3 and all("moving_average" in f and "trend" in f for f in fc)
+
+
 def main() -> None:
     check_dep_imports()
     check_sqlite_vec_roundtrip()
@@ -657,6 +719,7 @@ def main() -> None:
     check_client_hardening()
     check_error_log_redaction()
     check_extract()
+    check_spend()
     print("selftest: all checks passed")
 
 
