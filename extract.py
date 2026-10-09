@@ -125,7 +125,10 @@ def _insert_extraction(conn, run_id: int, merged: Extraction) -> None:
         canonical = ent.name.lower()
         key = (canonical, ent.type)
         if key in entity_ids:
-            continue  # same name+type within this run -> one entity
+            # Repeated segment mentions still contribute their evidence links.
+            for cid in ok_ids:
+                conn.execute("INSERT OR IGNORE INTO chunk_entities(chunk_id, entity_id) VALUES(?,?)", (cid, entity_ids[key]))
+            continue
         existing = conn.execute(
             "SELECT id FROM entities WHERE canonical=? AND type=?", (canonical, ent.type)
         ).fetchone()
@@ -199,11 +202,26 @@ def extract_run(conn, cfg: Config, run_id: int, *, extract_fn=None) -> Extractio
         dict(r) for r in conn.execute("SELECT id, text FROM chunks WHERE run_id=? ORDER BY seq", (run_id,))
     ]
     merged = Extraction()
+    seen_relations: set[str] = set()
+    seen_transactions: set[str] = set()
     for seg in _segment_chunks(chunks):
         result = _run_extraction(cfg, seg, extract_fn)
         merged.entities.extend(result.entities)
-        merged.relations.extend(result.relations)
-        merged.transactions.extend(result.transactions)
+        # Suppress the same evidence-backed fact reported by overlapping segments.
+        # Keep repeated rows within one response: they may be distinct purchases.
+        for facts, dest, seen in (
+            (result.relations, merged.relations, seen_relations),
+            (result.transactions, merged.transactions, seen_transactions),
+        ):
+            segment_keys = set()
+            for fact in facts:
+                data = fact.model_dump()
+                data["chunk_ids"] = sorted(set(data["chunk_ids"]))
+                key = json.dumps(data, sort_keys=True, ensure_ascii=False)
+                if key not in seen:
+                    dest.append(fact)
+                segment_keys.add(key)
+            seen.update(segment_keys)
     _insert_extraction(conn, run_id, merged)
     return merged
 
@@ -217,7 +235,7 @@ def extract_all(conn, cfg: Config, *, extract_fn=None) -> int:
     """Extract every queryable run whose extraction hasn't been attempted."""
     rows = conn.execute(
         """
-        SELECT r.id FROM index_runs r
+        SELECT DISTINCT r.id FROM index_runs r
         JOIN files f ON f.current_run_id = r.id AND f.status != 'removed'
         WHERE r.state = 'embedded'
         """
