@@ -42,9 +42,15 @@ def _fts_search(conn, query: str, k: int = FTS_K) -> list[int]:
 
 def _entity_chunks(conn, query: str) -> list[int]:
     """Chunks mentioning entities whose name/alias contains the query."""
+    queryable = db.queryable_run_ids(conn)
+    if not queryable:
+        return []
+    ph_r = ",".join("?" * len(queryable))
     rows = conn.execute(
-        "SELECT id FROM entities WHERE name LIKE ? OR id IN (SELECT entity_id FROM aliases WHERE alias LIKE ?) LIMIT 5",
-        (f"%{query}%", f"%{query}%"),
+        f"SELECT DISTINCT e.id FROM entities e JOIN chunk_entities ce ON ce.entity_id=e.id "
+        f"JOIN chunks c ON c.id=ce.chunk_id WHERE e.status != 'rejected' AND c.run_id IN ({ph_r}) "
+        "AND (e.name LIKE ? OR e.id IN (SELECT entity_id FROM aliases WHERE alias LIKE ?)) LIMIT 5",
+        queryable + [f"%{query}%", f"%{query}%"],
     ).fetchall()
     ids = [r["id"] for r in rows]
     if not ids:
@@ -52,7 +58,9 @@ def _entity_chunks(conn, query: str) -> list[int]:
     ph = ",".join("?" * len(ids))
     return [
         r["chunk_id"]
-        for r in conn.execute(f"SELECT chunk_id FROM chunk_entities WHERE entity_id IN ({ph})", ids)
+        for r in conn.execute(
+            f"SELECT DISTINCT ce.chunk_id FROM chunk_entities ce JOIN chunks c ON c.id=ce.chunk_id "
+            f"WHERE ce.entity_id IN ({ph}) AND c.run_id IN ({ph_r})", ids + queryable)
     ]
 
 
@@ -67,16 +75,20 @@ def _graph_chunks(conn, seed_chunks: list[int], max_depth: int = 2) -> list[int]
     ph_r = ",".join("?" * len(queryable))
     sql = f"""
         WITH RECURSIVE walk(entity_id, depth) AS (
-            SELECT ce.entity_id, 0 FROM chunk_entities ce WHERE ce.chunk_id IN ({ph_c})
+            SELECT ce.entity_id, 0 FROM chunk_entities ce
+            JOIN entities e ON e.id=ce.entity_id JOIN chunks c ON c.id=ce.chunk_id
+            WHERE ce.chunk_id IN ({ph_c}) AND e.status != 'rejected' AND c.run_id IN ({ph_r})
             UNION
             SELECT r.dst, w.depth + 1 FROM relations r
             JOIN walk w ON r.src = w.entity_id
-            WHERE r.status = 'confirmed' AND w.depth < {max_depth} AND r.run_id IN ({ph_r})
+            JOIN entities e ON e.id=r.dst
+            WHERE r.status = 'confirmed' AND e.status != 'rejected' AND w.depth < {max_depth} AND r.run_id IN ({ph_r})
         )
         SELECT DISTINCT ce.chunk_id FROM chunk_entities ce
-        WHERE ce.entity_id IN (SELECT entity_id FROM walk)
+        JOIN chunks c ON c.id=ce.chunk_id
+        WHERE ce.entity_id IN (SELECT entity_id FROM walk) AND c.run_id IN ({ph_r})
     """
-    return [r["chunk_id"] for r in conn.execute(sql, seed_chunks + queryable)]
+    return [r["chunk_id"] for r in conn.execute(sql, seed_chunks + queryable * 3)]
 
 
 def rrf(ranked_lists: list[list[int]], k: int = 60) -> list[int]:

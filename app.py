@@ -115,19 +115,62 @@ def render_app(cfg, conn) -> None:
             use_container_width=True,
         )
 
+        st.subheader("Review entities")
+        for entity in entities:
+            if entity["status"] != "pending":
+                continue
+            st.write(f"Entity {entity['id']}: {entity['name']} ({entity['type']})")
+            with st.expander(f"Entity {entity['id']} source evidence"):
+                for chunk in conn.execute(
+                    "SELECT c.id, c.text FROM chunk_entities ce JOIN chunks c ON c.id=ce.chunk_id WHERE ce.entity_id=?",
+                    (entity["id"],),
+                ):
+                    st.text(f"Chunk {chunk['id']}: {chunk['text']}")
+            confirm, reject = st.columns(2)
+            if confirm.button("Confirm entity", key=f"entity_confirm{entity['id']}"):
+                try:
+                    db.review_fact(conn, "entity", entity["id"], "confirmed")
+                except ValueError as e:
+                    st.error(str(e))
+                else:
+                    st.rerun()
+            if reject.button("Reject entity", key=f"entity_reject{entity['id']}"):
+                db.review_fact(conn, "entity", entity["id"], "rejected")
+                st.rerun()
+
         st.subheader("Relations (quote_verified = citation exists; status = human judgment)")
         rels = conn.execute(
-            "SELECT a.name AS src, r.rel, b.name AS dst, r.valid_from, r.valid_to, r.quote_verified, r.status, r.quote "
+            "SELECT r.id, a.name AS src, r.rel, b.name AS dst, r.valid_from, r.valid_to, r.quote_verified, r.status, r.quote, r.evidence_chunk_ids "
             "FROM relations r JOIN entities a ON a.id = r.src JOIN entities b ON b.id = r.dst ORDER BY r.id"
         ).fetchall()
         st.dataframe([dict(x) for x in rels], use_container_width=True)
+        for relation in rels:
+            if relation["status"] != "pending":
+                continue
+            st.write(f"Relation {relation['id']}: {relation['src']} — {relation['rel']} — {relation['dst']}")
+            with st.expander(f"Relation {relation['id']} source evidence"):
+                for cid in json.loads(relation["evidence_chunk_ids"] or "[]"):
+                    chunk = conn.execute("SELECT text FROM chunks WHERE id=?", (cid,)).fetchone()
+                    if chunk:
+                        st.text(f"Chunk {cid}: {chunk['text']}")
+            confirm, reject = st.columns(2)
+            if confirm.button("Confirm relation", key=f"relation_confirm{relation['id']}"):
+                try:
+                    db.review_fact(conn, "relation", relation["id"], "confirmed")
+                except ValueError as e:
+                    st.error(str(e))
+                else:
+                    st.rerun()
+            if reject.button("Reject relation", key=f"relation_reject{relation['id']}"):
+                db.review_fact(conn, "relation", relation["id"], "rejected")
+                st.rerun()
 
         with st.form("correction"):
             eid = st.selectbox("Entity", options=[(e["id"], e["name"]) for e in entities], format_func=lambda t: t[1])
             new_name = st.text_input("Corrected name (blank = keep)")
             new_type = st.text_input("Corrected type (blank = keep)")
             note = st.text_input("Note")
-            if st.form_submit_button("Save correction"):
+            if st.form_submit_button("Save correction", disabled=not entities):
                 conn.execute(
                     "INSERT INTO entity_corrections(entity_id, new_name, new_type, note, by) VALUES(?,?,?,?, 'human') "
                     "ON CONFLICT(entity_id) DO UPDATE SET new_name=excluded.new_name, new_type=excluded.new_type, note=excluded.note",
