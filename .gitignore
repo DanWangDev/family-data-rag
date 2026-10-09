@@ -9,6 +9,23 @@ data/
 # Local config
 config.toml
 
+# Credentials and local scan reports (templates remain reviewable)
+.env
+.env.*
+!.env.example
+!.env.sample
+.secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+credentials.json
+service-account*.json
+.security-audit/
+gitleaks-report*.json
+
 # OS
 Thumbs.db
 Desktop.ini
