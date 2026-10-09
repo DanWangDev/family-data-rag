@@ -110,6 +110,23 @@ def _valid_chunks(conn, run_id: int) -> dict[int, str]:
 
 
 def _insert_extraction(conn, run_id: int, merged: Extraction) -> None:
+    """Publish a complete extraction and its state together, or publish nothing."""
+    conn.execute("SAVEPOINT extraction_result")
+    try:
+        _write_extraction(conn, run_id, merged)
+        conn.execute(
+            "UPDATE index_runs SET state='extracted', updated_at=datetime('now') WHERE id=?",
+            (run_id,),
+        )
+        conn.execute("RELEASE SAVEPOINT extraction_result")
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT extraction_result")
+        conn.execute("RELEASE SAVEPOINT extraction_result")
+        raise
+
+
+def _write_extraction(conn, run_id: int, merged: Extraction) -> None:
+    """Write inside the caller's extraction savepoint; never commit here."""
     valid = _valid_chunks(conn, run_id)
     file_row = conn.execute(
         "SELECT MIN(id) AS id FROM files WHERE current_run_id=?", (run_id,)
@@ -192,9 +209,6 @@ def _insert_extraction(conn, run_id: int, merged: Extraction) -> None:
             (file_id, run_id, txn.date[:10], txn.amount_minor, txn.scale, txn.currency,
              txn.merchant, txn.category, txn.kind, txn.description, json.dumps(txn.model_dump(), ensure_ascii=False)),
         )
-    conn.commit()
-
-
 def extract_run(conn, cfg: Config, run_id: int, *, extract_fn=None) -> Extraction:
     """Extract a single run; everything lands pending, evidence-validated, never merged."""
     extract_fn = extract_fn or _model_extract
