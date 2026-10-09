@@ -5,6 +5,7 @@ the real serialization — OLLAMA_MAX_LOADED_MODELS is only a backstop in run.ba
 """
 
 import threading
+from functools import cache
 
 import ollama
 
@@ -16,6 +17,7 @@ def embed_batch(model: str, texts: list[str]) -> list[list[float]]:
     return [list(e) for e in resp["embeddings"]]
 
 
+@cache
 def embed_dims(model: str) -> int:
     return len(embed_batch(model, ["probe"])[0])
 
@@ -38,6 +40,7 @@ def complete(
         return resp["message"]["content"]
 
 
+@cache
 def model_digest(model: str) -> str:
     """Digest of the locally installed model, for index_meta provenance."""
     for m in ollama.list()["models"]:

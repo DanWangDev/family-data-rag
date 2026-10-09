@@ -281,12 +281,83 @@ def check_ingest_flow() -> None:
         conn.close()
 
 
+def check_retrieve_and_chat() -> None:
+    """RRF math, hybrid retrieval with citations, generation refusal, prompt contract — model-free."""
+    import json
+    from pathlib import Path
+
+    import chat
+    import config
+    import db
+    import retrieve
+
+    # RRF ordering on a fixed small input (scores: 2 > 3 > 1 > 4)
+    assert retrieve.rrf([[1, 2, 3], [2, 3, 4]]) == [2, 3, 1, 4]
+
+    cfg = config.Config(
+        source_dirs=(), db_path="unused", blob_dir=Path("unused"),
+        max_file_mb=100, photo_captions=False,
+        models=config.Models(chat="qwen3:14b", extract="qwen3:8b", embed="fake-embed", vision="qwen3-vl:8b"),
+    )
+    fake_embed = lambda model, texts: [[0.25] * 4 for _ in texts]
+
+    conn = db.connect(":memory:")
+    gen = db.init_db(conn, dims=4, embed_model="fake-embed", embed_digest="deadbeef")
+    cur = conn.execute("INSERT INTO file_versions(sha256, size_bytes, blob_path) VALUES(?, 10, 'blob/x')", ("a" * 64,))
+    version_id = cur.lastrowid
+    cur = conn.execute("INSERT INTO index_runs(version_id, generation_id, state) VALUES(?,?, 'embedded')", (version_id, gen))
+    run_id = cur.lastrowid
+    cur = conn.execute(
+        "INSERT INTO files(source_path, name, kind, ext, current_version_id, current_run_id, status) "
+        "VALUES('src/bills.txt', 'bills.txt', 'txt', 'txt', ?, ?, 'embedded')",
+        (version_id, run_id),
+    )
+    conn.commit()
+
+    texts = ["electricity bill for the house in March", "shopping list for groceries"]
+    chunk_ids: list[int] = []
+    for seq, text in enumerate(texts):
+        cur = conn.execute("INSERT INTO chunks(run_id, seq, text, page, kind) VALUES(?,?,?,?, 'body')", (run_id, seq, text, seq + 1))
+        cid = cur.lastrowid
+        chunk_ids.append(cid)
+        conn.execute("INSERT INTO vec_chunks(rowid, embedding) VALUES(?,?)", (cid, json.dumps([0.25] * 4)))
+        conn.execute("INSERT INTO fts_chunks(rowid, text) VALUES(?,?)", (cid, "electricity bill house march" if seq == 0 else "shopping list groceries"))
+    conn.commit()
+
+    hits = retrieve.retrieve(conn, cfg, "electricity bill", embed_fn=fake_embed, dims=4, digest="deadbeef")
+    assert hits, "retrieval returned nothing"
+    assert hits[0]["id"] == chunk_ids[0], f"fts/vec should rank the bill chunk first: {hits}"
+    assert hits[0]["source_path"] == "src/bills.txt" and hits[0]["name"] == "bills.txt"
+
+    # generation mismatch -> refusal
+    try:
+        retrieve.retrieve(conn, cfg, "x", embed_fn=fake_embed, dims=8, digest="deadbeef")
+        raise AssertionError("retrieval on a mismatched generation should refuse")
+    except RuntimeError:
+        pass
+
+    # prompt contract: citations present; document content is data, not instructions
+    msgs = chat.build_prompt("what is the bill?", hits)
+    assert "DATA" in msgs[0]["content"] and "instructions" in msgs[0]["content"]
+    assert "[1]" in msgs[1]["content"] and "bills.txt" in msgs[1]["content"]
+
+    # empty-result guard: no chunks -> refusal message, no model call
+    real_retrieve = chat.retrieve.retrieve
+    chat.retrieve.retrieve = lambda conn, cfg, q, **kw: []
+    try:
+        empty = chat.ask(conn, cfg, "anything", embed_fn=fake_embed, dims=4, digest="deadbeef")
+    finally:
+        chat.retrieve.retrieve = real_retrieve
+    assert empty["sources"] == [] and "No relevant documents" in empty["answer"]
+
+
 def main() -> None:
     check_dep_imports()
     check_sqlite_vec_roundtrip()
     check_ocr_roundtrip()
     check_db_switch_contract()
     check_ingest_flow()
+    check_retrieve_and_chat()
     print("selftest: all checks passed")
 
 
