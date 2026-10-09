@@ -103,7 +103,7 @@ def render_app(cfg, conn) -> None:
             "Corrections are an override layer — queries and display use them, re-extraction never overwrites them."
         )
         corrections = extract.corrected_entities(conn)
-        entities = conn.execute("SELECT id, name, type, status, attrs FROM entities ORDER BY type, name").fetchall()
+        entities = conn.execute("SELECT id, name, type, status, attrs FROM effective_entities ORDER BY type, name").fetchall()
         st.dataframe(
             [{
                 "id": e["id"],
@@ -141,7 +141,7 @@ def render_app(cfg, conn) -> None:
         st.subheader("Relations (quote_verified = citation exists; status = human judgment)")
         rels = conn.execute(
             "SELECT r.id, a.name AS src, r.rel, b.name AS dst, r.valid_from, r.valid_to, r.quote_verified, r.status, r.quote, r.evidence_chunk_ids "
-            "FROM relations r JOIN entities a ON a.id = r.src JOIN entities b ON b.id = r.dst ORDER BY r.id"
+            "FROM relations r JOIN effective_entities a ON a.id = r.src JOIN effective_entities b ON b.id = r.dst ORDER BY r.id"
         ).fetchall()
         st.dataframe([dict(x) for x in rels], use_container_width=True)
         for relation in rels:
@@ -184,8 +184,8 @@ def render_app(cfg, conn) -> None:
         if not candidates:
             st.caption("No pending merge candidates.")
         for c in candidates:
-            ea = conn.execute("SELECT name FROM entities WHERE id=?", (c["a"],)).fetchone()["name"]
-            eb = conn.execute("SELECT name FROM entities WHERE id=?", (c["b"],)).fetchone()["name"]
+            ea = conn.execute("SELECT name FROM effective_entities WHERE id=?", (c["a"],)).fetchone()["name"]
+            eb = conn.execute("SELECT name FROM effective_entities WHERE id=?", (c["b"],)).fetchone()["name"]
             st.markdown(f"`{ea}` (id {c['a']}) and `{eb}` (id {c['b']}) share a name. Same person?")
             b1, b2 = st.columns(2)
             if b1.button("Yes — alias them", key=f"yes{c['id']}"):

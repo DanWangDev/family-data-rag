@@ -127,6 +127,7 @@ def _insert_extraction(conn, run_id: int, merged: Extraction) -> None:
 
 def _write_extraction(conn, run_id: int, merged: Extraction) -> None:
     """Write inside the caller's extraction savepoint; never commit here."""
+    version_id = conn.execute("SELECT version_id FROM index_runs WHERE id=?", (run_id,)).fetchone()[0]
     valid = _valid_chunks(conn, run_id)
     file_row = conn.execute(
         "SELECT MIN(id) AS id FROM files WHERE current_run_id=?", (run_id,)
@@ -146,10 +147,17 @@ def _write_extraction(conn, run_id: int, merged: Extraction) -> None:
             for cid in ok_ids:
                 conn.execute("INSERT OR IGNORE INTO chunk_entities(chunk_id, entity_id) VALUES(?,?)", (cid, entity_ids[key]))
             continue
+        mapped = conn.execute(
+            "SELECT entity_id FROM version_entities WHERE version_id=? AND canonical=? AND type=?",
+            (version_id, canonical, ent.type),
+        ).fetchone()
         existing = conn.execute(
             "SELECT id FROM entities WHERE canonical=? AND type=?", (canonical, ent.type)
         ).fetchone()
-        if existing:
+        if mapped:
+            # Same original content, including a new generation: preserve human identity.
+            entity_ids[key] = mapped["entity_id"]
+        elif existing:
             # same name elsewhere: merge CANDIDATE, never auto-merge
             cur = conn.execute(
                 "INSERT INTO entities(name, type, canonical, attrs) VALUES(?,?,?,?)",
@@ -168,6 +176,10 @@ def _write_extraction(conn, run_id: int, merged: Extraction) -> None:
                 (ent.name, ent.type, canonical, json.dumps(ent.attrs, ensure_ascii=False)),
             )
             entity_ids[key] = cur.lastrowid
+        conn.execute(
+            "INSERT OR IGNORE INTO version_entities(version_id,canonical,type,entity_id) VALUES(?,?,?,?)",
+            (version_id, canonical, ent.type, entity_ids[key]),
+        )
         name_to_ids.setdefault(canonical, set()).add(entity_ids[key])
         for cid in ok_ids:
             conn.execute("INSERT OR IGNORE INTO chunk_entities(chunk_id, entity_id) VALUES(?,?)", (cid, entity_ids[key]))

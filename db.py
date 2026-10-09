@@ -127,6 +127,18 @@ CREATE TABLE IF NOT EXISTS entity_corrections(
   by TEXT,
   at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+CREATE TABLE IF NOT EXISTS version_entities(
+  version_id INTEGER NOT NULL REFERENCES file_versions(id) ON DELETE CASCADE,
+  canonical TEXT NOT NULL,
+  type TEXT NOT NULL,
+  entity_id INTEGER NOT NULL REFERENCES entities(id),
+  PRIMARY KEY(version_id, canonical, type)
+);
+CREATE VIEW IF NOT EXISTS effective_entities AS
+SELECT e.id, COALESCE(NULLIF(c.new_name, ''), e.name) AS name,
+       COALESCE(NULLIF(c.new_type, ''), e.type) AS type,
+       e.name AS original_name, e.type AS original_type, e.canonical, e.status, e.attrs
+FROM entities e LEFT JOIN entity_corrections c ON c.entity_id=e.id;
 
 -- spending (Phase 3)
 CREATE TABLE IF NOT EXISTS transactions(
@@ -245,6 +257,7 @@ def init_db(conn: sqlite3.Connection, *, dims: int, embed_model: str, embed_dige
     """Create tables (vec dims fixed at creation) and the first index_meta row. Returns generation id."""
     conn.executescript(SCHEMA)
     migrate_transaction_review(conn)
+    migrate_entity_versions(conn)
     ensure_vec_tables(conn, dims)
     conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(text)")
     conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS fts_staging USING fts5(text)")
@@ -271,6 +284,18 @@ def migrate_transaction_review(conn: sqlite3.Connection) -> None:
             valid = {r["id"] for r in conn.execute("SELECT id FROM chunks WHERE run_id=?", (row["run_id"],))}
             evidence = sorted({cid for cid in ids if type(cid) is int and cid in valid}) if isinstance(ids, list) else []
             conn.execute("UPDATE transactions SET evidence_chunk_ids=? WHERE id=?", (json.dumps(evidence), row["id"]))
+    conn.commit()
+
+
+def migrate_entity_versions(conn: sqlite3.Connection) -> None:
+    """Backfill only unambiguous identities; never merge historical duplicates."""
+    conn.execute(
+        "INSERT OR IGNORE INTO version_entities(version_id,canonical,type,entity_id) "
+        "SELECT r.version_id,e.canonical,e.type,MIN(e.id) FROM entities e "
+        "JOIN chunk_entities ce ON ce.entity_id=e.id JOIN chunks c ON c.id=ce.chunk_id "
+        "JOIN index_runs r ON r.id=c.run_id GROUP BY r.version_id,e.canonical,e.type "
+        "HAVING COUNT(DISTINCT e.id)=1"
+    )
     conn.commit()
 
 

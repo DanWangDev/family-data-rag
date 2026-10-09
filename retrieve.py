@@ -47,10 +47,10 @@ def _entity_chunks(conn, query: str) -> list[int]:
         return []
     ph_r = ",".join("?" * len(queryable))
     rows = conn.execute(
-        f"SELECT DISTINCT e.id FROM entities e JOIN chunk_entities ce ON ce.entity_id=e.id "
+        f"SELECT DISTINCT e.id FROM effective_entities e JOIN chunk_entities ce ON ce.entity_id=e.id "
         f"JOIN chunks c ON c.id=ce.chunk_id WHERE e.status != 'rejected' AND c.run_id IN ({ph_r}) "
-        "AND (e.name LIKE ? OR e.id IN (SELECT entity_id FROM aliases WHERE alias LIKE ?)) LIMIT 5",
-        queryable + [f"%{query}%", f"%{query}%"],
+        "AND (e.name LIKE ? OR e.original_name LIKE ? OR e.id IN (SELECT entity_id FROM aliases WHERE alias LIKE ?)) LIMIT 5",
+        queryable + [f"%{query}%"] * 3,
     ).fetchall()
     ids = [r["id"] for r in rows]
     if not ids:
