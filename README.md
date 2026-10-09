@@ -1,139 +1,141 @@
 # Family Data RAG
 
-面向家庭文档、照片、账单与合同的本地数据系统：保存原始材料，提供可追溯的检索和问答，再逐步增加知识关系、支出对账与消费周期分析。
+**English** | [简体中文](README.zh-CN.md)
 
-设计目标是本机处理：Ollama 提供模型推理，SQLite 保存数据和索引，NAS 作为文件来源。安装依赖与下载模型需要联网。**本地运行边界仍需配置和验证，不能仅凭使用 Ollama 就认为数据不会外传。**
+A local data system for family documents, photos, bills, and contracts: preserve original materials, provide traceable search and question answering, and gradually add knowledge relationships, spending reconciliation, and consumption-cycle analysis.
 
-## 开发状态
+The design targets local processing: Ollama runs model inference, SQLite stores data and indexes, and a NAS provides source files. Installing dependencies and downloading models requires internet access. **The local processing boundary still needs configuration and verification; using Ollama alone does not guarantee that data stays on the machine.**
 
-本 README 描述最终设计，并区分当前代码与后续能力。状态核对日期：2026-10-09，主工作区提交 `fca6229` 及当时未提交变更；Claude Code 正在并行开发。Phase 1 基础代码已提交，下一阶段为知识图谱抽取；真实资料与模型质量验收单独进行。
+## Development status
 
-| 能力 | 当前状态 | 主要文件 |
+This README describes the intended design and distinguishes current code from planned capabilities. Status checked on 2026-10-09 against primary workspace commit `fca6229` and its then-uncommitted changes; Claude Code was developing in parallel. Phase 1 foundation code had been committed, with knowledge graph extraction next. Acceptance testing with real materials and evaluation of model quality are separate activities.
+
+| Capability | Current status | Main files |
 | --- | --- | --- |
-| 配置、数据库 schema、索引切换 | 已有代码和本地自检 | `config.py`、`db.py` |
-| 扫描、去重、解析、切块、embedding、移除/清理 | 工作区已有开发中实现 | `ingest.py`、`parsers.py`、`textutil.py` |
-| Ollama 调用 | 开发中；本地端点与认证头限制尚需加固 | `models.py` |
-| 混合检索、引用问答、Chat/Files UI | 已有实现；模型回答质量与 UI 尚需真实数据验收 | `retrieve.py`、`chat.py`、`app.py` |
-| 图谱抽取、人工确认与纠正 | 已有 schema，业务流程规划中 | `extract.py` |
-| 交易抽取、月度对账、预测 | 已有 schema，业务流程规划中 | `spend.py` |
-| 备份清单、恢复检查、不同维度重建 | 已有 CLI 和合成测试；完整并发与恢复验收待完成 | `ingest.py`、`db.py` |
-| 本地启动与 cloud-disabled 检查 | 已有实现；客户端继承与监听接口检查待加固 | `run.bat`、`run.ps1` |
+| Configuration, database schema, index switching | Code and local self-tests available | `config.py`, `db.py` |
+| Scanning, deduplication, parsing, chunking, embeddings, removal/cleanup | Implementation in development in the workspace | `ingest.py`, `parsers.py`, `textutil.py` |
+| Ollama calls | In development; local endpoint and authentication-header restrictions still need hardening | `models.py` |
+| Hybrid retrieval, answers with citations, Chat/Files UI | Implemented; model answer quality and UI still need acceptance testing with real data | `retrieve.py`, `chat.py`, `app.py` |
+| Graph extraction, human confirmation and correction | Schema available; business workflow planned | `extract.py` |
+| Transaction extraction, monthly reconciliation, forecasting | Schema available; business workflow planned | `spend.py` |
+| Backup manifests, restore checks, rebuilding with different dimensions | CLI and synthetic tests available; full concurrency and restore acceptance testing pending | `ingest.py`, `db.py` |
+| Local startup and cloud-disabled checks | Implemented; client environment inheritance and listening-interface checks still need hardening | `run.bat`, `run.ps1` |
 
-自检通过只表示现有合成样本检查通过。环境测量见 [bench.md](bench.md)；凭据检查结果和未关闭问题见 [安全审查记录](docs/security-review.md)。
+Passing self-tests only means that the existing synthetic checks passed. See [bench.md](bench.md) for environment measurements and the [security review](docs/security-review.md) for credential scan results and unresolved issues.
 
-## 整体架构
+## Architecture
 
-实线表示当前已有基础实现；虚线表示后续规划连接。安全边界是需要实现并验证的目标。
+Solid lines indicate existing foundation implementations; dashed lines indicate planned connections. The security boundary is a target that must be implemented and verified.
 
 ```mermaid
 flowchart LR
-    NAS["NAS / 本地来源目录"] --> ING["导入与生命周期 CLI\ningest.py"]
-    subgraph LOCAL["本机数据与应用边界"]
-        ING --> BLOB["原文件快照\nSHA-256 内容寻址 blob"]
-        BLOB --> PARSE["格式适配器\nPDF / DOCX / XLSX / CSV / JSON / 图片"]
-        PARSE --> CHUNK["切块与位置标识\n中文分词"]
-        CHUNK --> MODEL["Ollama 调用层\nembedding / chat / extraction / vision"]
-        CHUNK --> DB["SQLite\n版本 / runs / chunks / 图谱 / 交易"]
+    NAS["NAS / local source directories"] --> ING["Ingestion and lifecycle CLI\ningest.py"]
+    subgraph LOCAL["Local data and application boundary"]
+        ING --> BLOB["Original file snapshots\nSHA-256 content-addressed blobs"]
+        BLOB --> PARSE["Format adapters\nPDF / DOCX / XLSX / CSV / JSON / images"]
+        PARSE --> CHUNK["Chunking and location metadata\nChinese tokenization"]
+        CHUNK --> MODEL["Ollama call layer\nembedding / chat / extraction / vision"]
+        CHUNK --> DB["SQLite\nversions / runs / chunks / graph / transactions"]
         MODEL --> DB
-        DB --> STAGE["持久化候选索引\nvec_staging / fts_staging"]
-        STAGE --> SWITCH["原子切换 current_run_id"]
-        SWITCH --> LIVE["当前查询集合\nvec_chunks_N / fts_chunks"]
-        UI["Streamlit Chat / Files UI"] --> RET["向量 + 关键词 + 图谱扩展\nRRF 融合"]
+        DB --> STAGE["Persistent candidate indexes\nvec_staging / fts_staging"]
+        STAGE --> SWITCH["Atomic current_run_id switch"]
+        SWITCH --> LIVE["Current query set\nvec_chunks_N / fts_chunks"]
+        UI["Streamlit Chat / Files UI"] --> RET["Vector + keyword + graph expansion\nRRF fusion"]
         LIVE --> RET
         DB --> RET
-        RET --> ANSWER["带引用的回答\n证据不足 / 来源冲突"]
+        RET --> ANSWER["Answers with citations\nInsufficient evidence / conflicting sources"]
         MODEL --> ANSWER
         ANSWER --> UI
-        DB -.-> SPEND["人工复核 + SQL 对账\n支出与周期分析 · 规划中"]
+        DB -.-> SPEND["Human review + SQL reconciliation\nSpending and cycle analysis · planned"]
         SPEND -.-> UI
-        DB --> BACKUP["数据库快照 + blob manifest\n备份与恢复检查"]
+        DB --> BACKUP["Database snapshot + blob manifest\nBackup and restore checks"]
         BLOB --> BACKUP
     end
 ```
 
-先采用单个 SQLite 数据库与普通文件目录，不引入独立图数据库、对象存储服务或 RAG 框架。SQLite 使用 WAL、外键、sqlite-vec 和 FTS5；中文文本在索引和查询时采用一致分词。
+Start with a single SQLite database and ordinary file directories, without a separate graph database, object storage service, or RAG framework. SQLite uses WAL, foreign keys, sqlite-vec, and FTS5; Chinese text uses consistent tokenization during indexing and querying.
 
-## 数据模型与证据
+## Data model and evidence
 
 ```mermaid
 erDiagram
-    FILES }o--o| FILE_VERSIONS : "扫描内容指针"
-    FILE_VERSIONS ||--o{ INDEX_RUNS : "同一内容可重复索引"
-    INDEX_META ||--o{ INDEX_RUNS : "配置 generation"
+    FILES }o--o| FILE_VERSIONS : "scanned content pointer"
+    FILE_VERSIONS ||--o{ INDEX_RUNS : "same content can be reindexed"
+    INDEX_META ||--o{ INDEX_RUNS : "configuration generation"
     FILES }o--o| INDEX_RUNS : "current_run_id"
-    INDEX_RUNS ||--o{ CHUNKS : "文本与位置"
-    CHUNKS ||--o| LIVE_VECTOR : "当前查询投影"
-    CHUNKS ||--o| LIVE_FTS : "当前查询投影"
-    CHUNKS ||--o{ CHUNK_ENTITIES : "证据关联"
-    ENTITIES ||--o{ CHUNK_ENTITIES : "涉及实体"
-    ENTITIES ||--o{ ALIASES : "人工确认身份"
-    ENTITIES ||--o| ENTITY_CORRECTIONS : "人工覆盖层"
-    INDEX_RUNS ||--o{ RELATIONS : "关系抽取结果"
-    INDEX_RUNS ||--o{ TRANSACTIONS : "交易抽取结果"
-    TRANSACTIONS ||--o{ TXN_LINKS : "人工确认重复交易"
+    INDEX_RUNS ||--o{ CHUNKS : "text and location"
+    CHUNKS ||--o| LIVE_VECTOR : "current query projection"
+    CHUNKS ||--o| LIVE_FTS : "current query projection"
+    CHUNKS ||--o{ CHUNK_ENTITIES : "evidence links"
+    ENTITIES ||--o{ CHUNK_ENTITIES : "entities mentioned"
+    ENTITIES ||--o{ ALIASES : "human-confirmed identity"
+    ENTITIES ||--o| ENTITY_CORRECTIONS : "human override layer"
+    INDEX_RUNS ||--o{ RELATIONS : "extracted relationships"
+    INDEX_RUNS ||--o{ TRANSACTIONS : "extracted transactions"
+    TRANSACTIONS ||--o{ TXN_LINKS : "human-confirmed duplicate transactions"
 ```
 
-- **来源与内容分离**：路径标识来源；SHA-256 标识内容。多个来源可以共享内容版本与完成的索引 run。
-- **内容与索引分离**：`file_versions` 保存原始内容；`index_meta` 保存解析器、切块、embedding digest 和维度；`index_runs` 记录一次构建。内容不变也能重建索引。
-- **两个指针不同**：当前代码的 `current_version_id` 记录扫描发现的内容；`current_run_id` 决定可查询索引。新内容失败时旧索引继续可用；引用原文件应从 run 关联的版本取得。
-- **位置证据**：chunk 保存页码/文本范围、工作表/行范围、段落范围或 OCR 区域。内部 PDF 页号当前从 0 开始，UI 应转换为用户页号。
-- **人工判断**：同名只产生合并候选；引用存在与关系正确分别判断。人工纠正作为查询/展示覆盖层，不被重新抽取覆盖。
+- **Separate source from content**: paths identify sources; SHA-256 identifies content. Multiple sources can share a content version and a completed index run.
+- **Separate content from indexes**: `file_versions` stores original content; `index_meta` stores the parser, chunking configuration, embedding digest, and dimensions; `index_runs` records a build. Indexes can be rebuilt even when content has not changed.
+- **The two pointers serve different purposes**: in the current code, `current_version_id` records content found during scanning; `current_run_id` determines the queryable index. If indexing new content fails, the old index remains available. Citations to original files should resolve through the version associated with the run.
+- **Location evidence**: chunks store page numbers/text ranges, worksheets/row ranges, paragraph ranges, or OCR regions. Internal PDF page numbers currently start at 0; the UI should convert them to user-facing page numbers.
+- **Human judgment**: matching names only create merge candidates; the existence of a citation and the correctness of a relationship are assessed separately. Human corrections act as query/display overrides and are not overwritten by re-extraction.
 
-图谱与交易归属于 run，最终查询和统计都限制到当前有效 run。当前向量表按维度命名：`vec_chunks_N` / `vec_staging_N`；配置 generation 另由 `index_meta` 记录。重建逐文件切换；如果当前引用混合 generation，检索会拒绝执行，不代表全库重建具备不中断查询的原子切换。
+Graph data and transactions belong to runs; final queries and statistics are restricted to currently active runs. Current vector tables are named by dimension: `vec_chunks_N` / `vec_staging_N`; configuration generations are recorded separately in `index_meta`. Rebuilds switch one file at a time. If current references span mixed generations, retrieval refuses to run; this does not mean a full database rebuild supports an atomic switch with uninterrupted queries.
 
-## 导入、切换与删除
+## Ingestion, switching, and deletion
 
 ```mermaid
 sequenceDiagram
-    participant SRC as 来源文件
-    participant ING as 导入器
+    participant SRC as Source file
+    participant ING as Importer
     participant STORE as Blob / SQLite
-    participant OLL as 本地模型
-    participant LIVE as 当前查询集合
-    SRC->>ING: 格式/大小检查与 SHA
-    ING->>STORE: 保存或复用原始内容
-    ING->>STORE: 新建 run 或复用完成的 run
-    alt 需要构建
-        ING->>STORE: 解析、chunk、位置标识
-        ING->>OLL: 分批 embedding
-        OLL-->>ING: 向量
-        ING->>STORE: 保存候选索引
+    participant OLL as Local model
+    participant LIVE as Current query set
+    SRC->>ING: Format/size checks and SHA
+    ING->>STORE: Save or reuse original content
+    ING->>STORE: Create run or reuse completed run
+    alt Build required
+        ING->>STORE: Parse, chunk, record locations
+        ING->>OLL: Batch embeddings
+        OLL-->>ING: Vectors
+        ING->>STORE: Save candidate indexes
     end
-    alt 构建成功
-        ING->>STORE: 开始切换事务
-        STORE->>LIVE: 加入新 run
-        STORE->>STORE: 切换 current_run_id
-        STORE->>LIVE: 移出失去最后有效引用的旧 run
-        STORE-->>ING: 提交
-    else 构建失败
-        ING->>STORE: 记录失败状态
-        Note over STORE,LIVE: 旧指针与查询集合保持可用
+    alt Build successful
+        ING->>STORE: Begin switch transaction
+        STORE->>LIVE: Add new run
+        STORE->>STORE: Switch current_run_id
+        STORE->>LIVE: Remove old run after its last active reference is lost
+        STORE-->>ING: Commit
+    else Build failed
+        ING->>STORE: Record failure status
+        Note over STORE,LIVE: Old pointer and query set remain available
     end
 ```
 
-必须由 CI 验证的约束：
+Invariants that CI must verify:
 
-1. 候选 run 不参与检索。当前 staging 表也保存完成 run 的持久索引，便于再次引用时重新加入 live 集合。
-2. A、B 共享旧 run 时，A 更新不能影响 B；最后一个有效引用移除时，旧 run 立即退出查询，无需等待 GC。
-3. `remove` 移除来源；`purge` 删除内容和索引，拒绝仍被有效引用或正在构建的内容。
-4. NAS 离线/源文件消失时保留快照与索引。当前数据库以 `status != 'removed'` 定义有效来源；有旧 `current_run_id` 的失败/缺失来源仍可查询。
-5. GC、构建和备份必须协调。当前默认备份目录有 `backup.lock`；自定义备份目录与完整构建周期的并发协调仍需加固。
+1. Candidate runs do not participate in retrieval. Current staging tables also retain persistent indexes for completed runs, allowing them to rejoin the live set when referenced again.
+2. When A and B share an old run, updating A must not affect B. Once the last active reference is removed, the old run immediately leaves the query set without waiting for GC.
+3. `remove` removes a source; `purge` deletes content and indexes, rejecting content that is still actively referenced or being built.
+4. Snapshots and indexes are retained when the NAS is offline or source files disappear. The current database defines active sources as `status != 'removed'`; failed/missing sources with an old `current_run_id` remain queryable.
+5. GC, builds, and backups must coordinate. The default backup directory currently has a `backup.lock`; coordination for custom backup directories and the full build lifecycle still needs hardening.
 
-当前 blob 路径是 `data/blob/<sha256>.<ext>`，与计划中的目录布局略有不同；数据库保存实际 blob 路径。
+The current blob path is `data/blob/<sha256>.<ext>`, which differs slightly from the planned directory layout. The database stores the actual blob path.
 
-## 检索、图谱与支出
+## Retrieval, graph, and spending
 
-问答路径：query embedding → 当前向量 top-30 + 分词后全文 top-20 + 实体/别名匹配 → 最多两跳的已确认关系扩展 → RRF 融合 → 上下文预算内的证据 → 本地模型生成答案和引用。
+Question-answering path: query embedding → current vector top-30 + tokenized full-text top-20 + entity/alias matching → confirmed relationship expansion up to two hops → RRF fusion → evidence within the context budget → local model generates an answer and citations.
 
-图谱扩展实现已存在，关系抽取与人工确认流程尚待 Phase 2。关系遍历限制到当前有效 run 的已确认关系；所有候选还需保证在融合前处于当前查询集合。文档中的指令是待引用的数据，当前回答模型不获得执行命令或上传工具。证据不足与来源冲突是回答要求，实际模型遵从程度需单独评测。
+Graph expansion is implemented; relationship extraction and human confirmation workflows await Phase 2. Relationship traversal is restricted to confirmed relationships in currently active runs; every candidate must also be in the current query set before fusion. Instructions in documents are data to cite. The current answering model has no tools for executing commands or uploading data. Handling insufficient evidence and conflicting sources is a requirement for answers; actual model compliance needs separate evaluation.
 
-支出分析先对账，再预测：整数金额加币种 scale；区分消费、退款、转账与信用卡还款；发票/流水中的同一交易经人工确认去重。汇总和预测由 SQL/代码计算，模型只解释。商品补货周期需要数量、单位与明细，安排在后续阶段。
+Spending analysis starts with reconciliation, then forecasting: integer amounts with currency scales; distinguish purchases, refunds, transfers, and credit card repayments; deduplicate the same transaction across invoices/statements after human confirmation. SQL/code computes totals and forecasts; the model only explains them. Product replenishment cycles require quantities, units, and line items, and are planned for a later phase.
 
-照片 MVP 目标是日期、人工标签、OCR 与标记为 AI 生成的描述。当前原文件快照保留原始 EXIF，包括可能存在的 GPS；不读取 GPS 不代表原图已去除 GPS。图像 embedding 搜索尚未实现。
+The photo MVP targets dates, human tags, OCR, and descriptions labeled as AI-generated. Current original file snapshots retain original EXIF, including any GPS data. Not reading GPS does not mean it has been removed from the original image. Image embedding search is not yet implemented.
 
-## 本地开发与验证
+## Local development and validation
 
-当前基线是 Python 3.14、原生 Windows 和 Ollama。包版本以 `requirements.txt` 为准，安装后运行 smoke tests。
+The current baseline is Python 3.14, native Windows, and Ollama. Package versions are defined in `requirements.txt`; run smoke tests after installation.
 
 ```powershell
 python -m venv .venv
@@ -142,19 +144,19 @@ Copy-Item config.toml.example config.toml
 .\.venv\Scripts\python.exe -m selftest
 ```
 
-在 `config.toml` 填入来源目录、数据库与 blob 目录。NAS 使用操作系统账户/凭据管理；不要将密码放进配置、UNC 路径或示例文件。
+Set source directories, database paths, and blob directories in `config.toml`. Access the NAS through operating system accounts/credential management; do not put passwords in configuration, UNC paths, or example files.
 
-模型先单独下载。默认 embedding 为 `nomic-embed-text`；中英混合样本应比较 `bge-m3`，确定模型和维度后再完整导入。
+Download models separately first. The default embedding model is `nomic-embed-text`; compare `bge-m3` on mixed Chinese/English samples, then settle on the model and dimensions before full ingestion.
 
 ```powershell
 ollama pull qwen3:14b
 ollama pull qwen3:8b
 ollama pull qwen3-vl:8b
 ollama pull nomic-embed-text
-# 多语言对比候选：ollama pull bge-m3
+# Multilingual comparison candidate: ollama pull bge-m3
 ```
 
-实际导入前，在专用终端设置本地边界；先退出已有 Ollama 实例，再启动服务，使服务器继承配置。
+Before ingesting real data, configure the local boundary in a dedicated terminal. Stop existing Ollama instances first, then start the service so the server inherits the configuration.
 
 ```powershell
 $env:OLLAMA_HOST = '127.0.0.1:11434'
@@ -166,9 +168,9 @@ Remove-Item Env:OLLAMA_API_KEY -ErrorAction SilentlyContinue
 ollama serve
 ```
 
-运行 ingest 的另一个终端也要设置本地 `OLLAMA_HOST`、`NO_PROXY`，并移除继承的 `OLLAMA_API_KEY`。这些措施不替代代码层限制。
+The separate terminal running ingest must also set a local `OLLAMA_HOST` and `NO_PROXY`, and remove any inherited `OLLAMA_API_KEY`. These measures do not replace restrictions in code.
 
-当前工作区 CLI（开发中）：
+Current workspace CLI (in development):
 
 ```powershell
 .\.venv\Scripts\python.exe -m ingest --help
@@ -177,38 +179,38 @@ ollama serve
 .\.venv\Scripts\python.exe -m ingest parse
 .\.venv\Scripts\python.exe -m ingest backup
 .\.venv\Scripts\python.exe -m ingest restore-test
-# 开发中的 Chat / Files UI：
+# Chat / Files UI in development:
 .\run.bat
 ```
 
-`parse` 重试未成功索引当前内容的文件；`rebuild` 根据配置重新索引；`remove <path>`、`purge <sha256>`、`gc` 会修改数据。当前 CLI 初始化调用 embedding 维度探测和模型列表，所以 `status` / `restore-test` 也需要本地 Ollama。
+`parse` retries files whose current content has not been successfully indexed; `rebuild` reindexes according to configuration. `remove <path>`, `purge <sha256>`, and `gc` modify data. Current CLI initialization probes embedding dimensions and lists models, so `status` / `restore-test` also require local Ollama.
 
-`run.bat` 调用 `run.ps1`，设置本地环境并检查 cloud-disabled 状态，然后启动绑定 `127.0.0.1:8501` 的 Streamlit。它可能停止现有 Ollama 实例；检查失败默认拒绝继续，`--skip-check` 会绕过此保护。启动器尚未清除继承的 API key、禁用代理或验证实际监听接口。
+`run.bat` calls `run.ps1`, configures the local environment, checks cloud-disabled status, and starts Streamlit bound to `127.0.0.1:8501`. It may stop existing Ollama instances. Failed checks block startup by default; `--skip-check` bypasses this protection. The launcher does not yet remove inherited API keys, disable proxies, or verify actual listening interfaces.
 
-## 凭据与隐私保护
+## Credentials and privacy
 
-凭据文件、本地配置和 `data/` 由 `.gitignore` 排除；这不等于加密、不阻止强制添加，也不会撤销已提交文件。操作系统云同步需单独排除数据目录。原文件、数据库、向量、纠正记录和备份均需加密存储与访问控制。
+Credential files, local configuration, and `data/` are excluded by `.gitignore`. This does not encrypt data, prevent forced additions, or undo previously committed files. Data directories must be separately excluded from operating system cloud synchronization. Original files, databases, vectors, correction records, and backups all require encrypted storage and access control.
 
-[Secret scan CI](.github/workflows/secrets.yml) 使用固定版本 Gitleaks 检查工作树和完整可达历史，输出隐藏匹配值，不上传原始报告。自检 CI 使用合成数据；真实资料不得进入代码、CI artifacts 或日志。
+[Secret scan CI](.github/workflows/secrets.yml) uses a pinned Gitleaks version to check the working tree and all reachable history, redacts matched values, and does not upload raw reports. Self-test CI uses synthetic data; real materials must not enter code, CI artifacts, or logs.
 
-安装 Gitleaks 后可复查历史：
+After installing Gitleaks, recheck history with:
 
 ```powershell
 gitleaks git . --log-opts="--all --full-history" --redact=100 --no-banner
 ```
 
-工作区扫描需排除 `.git`、`.venv` 和缓存，另检查本地配置；不要为排除噪声忽略业务代码。
+Working tree scans should exclude `.git`, `.venv`, and caches, and check local configuration separately. Do not ignore business code to reduce scan noise.
 
-2026-10-09 审查未发现已扫描内容中的凭据匹配，但发现默认 SDK 继承端点/API key 的潜在泄露路径，以及原始异常日志风险。**运行时加固和网络验证完成前，不承诺零外传。** 见 [审查范围、复现与修复要求](docs/security-review.md)。
+The 2026-10-09 review found no credential matches in the scanned content, but identified potential leakage through the default SDK's endpoint/API key inheritance and risks from raw exception logging. **No zero-egress guarantee is made until runtime hardening and network verification are complete.** See the [review scope, reproductions, and remediation requirements](docs/security-review.md).
 
-## 路线图与工作流
+## Roadmap and workflow
 
-| 阶段 | 交付 | 验收 |
+| Phase | Deliverables | Acceptance criteria |
 | --- | --- | --- |
-| Phase 0 | 环境、smoke tests、最小 CI、模型基准 | Windows 导入/OCR/向量检查，记录实际模型与显存 |
-| Phase 1 | 可靠导入、混合检索、引用问答、备份恢复 | 共享引用隔离、失败保留旧索引、最后引用移出、恢复证据一致 |
-| Phase 2 | 有证据的图谱与人工确认 | 同名不自动合并、有效期与当前 run 范围、纠正保留 |
-| Phase 3 | 交易复核、整月对账、支出与周期分析 | 对账并解释差额，重复交易不重复计入 |
-| Phase 4 | 商品补货、照片时间线/视觉搜索、其他预测 | 按具体需求定义数据与准确性要求 |
+| Phase 0 | Environment, smoke tests, minimal CI, model benchmarks | Windows import/OCR/vector checks; record actual models and VRAM usage |
+| Phase 1 | Reliable ingestion, hybrid retrieval, answers with citations, backup/restore | Shared-reference isolation; failed builds retain old indexes; last-reference removal; restored evidence remains consistent |
+| Phase 2 | Evidence-backed graph and human confirmation | No automatic merging of matching names; validity periods and current-run scoping; corrections preserved |
+| Phase 3 | Transaction review, full-month reconciliation, spending and cycle analysis | Reconcile and explain differences; duplicate transactions are not counted twice |
+| Phase 4 | Product replenishment, photo timeline/visual search, other forecasts | Define data and accuracy requirements for each specific need |
 
-遵守 [AGENTS.md](AGENTS.md)：初始提交之后在任务分支工作，使用 Release Please 兼容的 Conventional Commits，频繁提交小而完整的变更，通过 PR 和 CI 合并到 `main`。
+Follow [AGENTS.md](AGENTS.md): after the initial commit, work on task branches, use Release Please-compatible Conventional Commits, commit small and complete changes frequently, and merge into `main` through PRs and CI.
