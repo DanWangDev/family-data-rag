@@ -1,5 +1,7 @@
 # Phase 0 benchmark — 2026-10-09
 
+**English** | [简体中文](bench.zh-CN.md)
+
 Machine: Windows 11 Pro, RTX 5070 Ti (16 GB, driver 617.42), Ollama 0.40.2.
 
 ## Models

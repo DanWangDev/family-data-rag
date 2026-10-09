@@ -1,70 +1,72 @@
-# 凭据与隐私审查记录
+# Credential and privacy review
 
-审查日期：2026-10-09（Europe/London）。末次复查基于主工作区 `fca6229` 及当时未提交变更。开发期间新增的 app/chat/retrieve、启动器和备份代码已纳入复查。这是代码快照审查，不是对未来提交或整个电脑的无泄露保证；本次没有修改 Claude 正在开发的业务代码。
+**English** | [简体中文](security-review.zh-CN.md)
 
-## 范围与方法
+Review date: 2026-10-09 (Europe/London). The final recheck was based on primary workspace commit `fca6229` and its then-uncommitted changes. Newly added app/chat/retrieve, launcher, and backup code was included. This is a review of a code snapshot, not a guarantee against leaks in future commits or across the entire computer. Business code under development by Claude was not modified during this review.
 
-- 检查主工作区的代码、文档、配置、CI 和未提交文件；包括开发过程中出现的临时 debug 脚本。
-- 使用 Gitleaks 8.30.1 扫描工作目录，包含被 Git 忽略的本地文件；排除 `.git/`、安装的 `.venv/` 与 `__pycache__/`。本次未导入 NAS 数据，也未读取操作系统凭据库；scanner 对二进制数据的扫描不能替代文档内容审查。
-- 使用 `gitleaks git --log-opts="--all --full-history"` 检查本地所有可达 refs 的提交内容。该扫描不代表已检查未获取的远端 refs、GitHub Actions secrets 或整个托管账户。
-- 单独扫描本地 Git 配置、提交消息与暂存差异；手工检查配置、SDK 的端点/认证头继承、日志和 CI 凭据持久化行为。
-- Scanner 下载自官方发布，并校验发布方 SHA-256。检测输出启用 `--redact=100`；原始报告保留在仓库外临时目录，不提交或上传，不用真实凭据尝试登录任何服务。
-- [Gitleaks 的检测方式与命令](https://github.com/gitleaks/gitleaks)属于规则检测；无法识别所有自定义秘密，也不验证令牌是否有效。
+## Scope and methods
 
-## 结果
+- Checked code, documentation, configuration, CI, and uncommitted files in the primary workspace, including temporary debug scripts created during development.
+- Scanned the working directory with Gitleaks 8.30.1, including local files ignored by Git; excluded `.git/`, the installed `.venv/`, and `__pycache__/`. No NAS data was imported, and the operating system credential store was not read. Scanner checks of binary data do not replace a review of document contents.
+- Used `gitleaks git --log-opts="--all --full-history"` to inspect commits on all locally reachable refs. This scan does not cover remote refs that have not been fetched, GitHub Actions secrets, or the entire hosting account.
+- Separately scanned local Git configuration, commit messages, and staged diffs; manually checked configuration, SDK endpoint/authentication-header inheritance, logging, and CI credential persistence.
+- Downloaded the scanner from its official release and verified the publisher's SHA-256 checksum. Detection output used `--redact=100`; raw reports stayed in a temporary directory outside the repository and were neither committed nor uploaded. No real credentials were used to attempt service logins.
+- [Gitleaks detection and commands](https://github.com/gitleaks/gitleaks) are rule-based; they cannot identify every custom secret or verify whether a token is valid.
 
-| 检查 | 结果 |
+## Results
+
+| Check | Result |
 | --- | --- |
-| 工作区 Gitleaks 扫描 | 未发现匹配 |
-| 本地可达 Git 历史扫描 | 未发现匹配 |
-| 本地 Git 配置与提交消息 | 未发现匹配 |
-| 暂存差异 | 未发现匹配；扫描时没有暂存变更 |
-| 当前配置示例与 CI | 未发现硬编码凭据 |
-| `python -m selftest` | 本地合成样本检查通过 |
-| Scanner 正向控制 | 在仓库外生成不具备服务授权的合成 token，规则检测成功且输出/报告完全隐藏匹配值 |
-| SDK 环境继承复现 | 使用合成环境变量检查客户端配置，确认端点与认证头继承；没有发出网络请求 |
-| 新增 CI workflow | YAML、最小权限与不持久化凭据配置检查通过；尚未在 GitHub runner 执行 |
+| Working directory Gitleaks scan | No matches found |
+| Locally reachable Git history scan | No matches found |
+| Local Git configuration and commit messages | No matches found |
+| Staged diff | No matches found; there were no staged changes at scan time |
+| Current configuration examples and CI | No hardcoded credentials found |
+| `python -m selftest` | Local synthetic checks passed |
+| Scanner positive control | A synthetic token with no service authorization was generated outside the repository; rule detection succeeded and matched values were fully redacted in output/reports |
+| SDK environment inheritance reproduction | Synthetic environment variables were used to inspect client configuration, confirming endpoint and authentication-header inheritance; no network requests were made |
+| New CI workflow | YAML, minimal permissions, and configuration preventing credential persistence were checked; it had not yet run on a GitHub runner |
 
-`bench.md` 的模型 ID、量化配置和硬件信息不是认证凭据；测试中的 `deadbeef`、`cafebabe` 等是合成模型 digest。未发现已提交或当前代码中的 API key、密码、私钥匹配。下面的运行时路径仍需关闭，不能据此宣称零外传。
+The model IDs, quantization settings, and hardware information in `bench.md` are not authentication credentials; values such as `deadbeef` and `cafebabe` in tests are synthetic model digests. No API key, password, or private key matches were found in committed or current code. The runtime paths below still need to be closed; these results do not justify a zero-egress claim.
 
-## 需要开发者修复的运行时问题
+## Runtime issues requiring developer fixes
 
-### 1. 默认 Ollama 客户端继承端点和认证头（优先）
+### 1. Default Ollama client inherits endpoints and authentication headers (priority)
 
-位置：`models.py` 的 `embed_batch()`、`complete()`、`model_digest()`。
+Locations: `embed_batch()`, `complete()`, and `model_digest()` in `models.py`.
 
-这些函数使用 `ollama.embed/chat/list`，即 SDK 的默认客户端。当前安装的 SDK 在初始化时读取 `OLLAMA_HOST`，并在存在 `OLLAMA_API_KEY` 时自动添加 Bearer Authorization。项目代码未限制 loopback，也没有清除该认证头。
+These functions use `ollama.embed/chat/list`, the SDK's default client. The currently installed SDK reads `OLLAMA_HOST` during initialization and automatically adds Bearer Authorization when `OLLAMA_API_KEY` is present. Project code does not restrict the endpoint to loopback or clear this authentication header.
 
-如果启动环境继承了远端端点与 API key，文本和凭据可能发送到该端点。HTTP 代理环境、重定向和云模型选择也需要显式控制。这是代码路径风险；本次未发现实际令牌，也未观测到真实外传。
+If the startup environment inherits a remote endpoint and API key, text and credentials may be sent there. HTTP proxy environments, redirects, and cloud model selection also need explicit controls. This is a code-path risk; the review found no actual tokens and observed no real data leaving the machine.
 
-建议实现一个共享的本地客户端：显式固定或严格校验 `http://127.0.0.1:11434`；禁用环境代理与重定向；在最终发送请求前去掉 Authorization，而不是在客户端构造之后才修改环境；拒绝云模型配置，并校验服务 cloud-disabled 状态。SDK 客户端构造本身会继承 API key，只指定 `host` 不足以消除认证头。
+Recommended implementation: a shared local client that explicitly pins or strictly validates `http://127.0.0.1:11434`; disables environment proxies and redirects; removes Authorization before requests are sent, rather than changing the environment after constructing the client; rejects cloud model configuration; and verifies the service's cloud-disabled status. SDK client construction itself inherits API keys, so specifying only `host` is insufficient to remove the authentication header.
 
-验收：使用合成 key、远端 `OLLAMA_HOST`、代理环境和 mock transport，在不联网的测试中断言所有调用仅允许目标 loopback、请求无 Authorization、云配置被拒绝；检查 embed/chat/list 全部路径。
+Acceptance criteria: use a synthetic key, remote `OLLAMA_HOST`, proxy environments, and mock transport in offline tests to assert that every call permits only the intended loopback endpoint, sends no Authorization, and rejects cloud configuration. Cover all embed/chat/list paths.
 
-README 提供的专用终端配置与移除进程内 `OLLAMA_API_KEY` 是临时运行措施，不替代上述代码加固。
+The dedicated-terminal configuration and removal of process-local `OLLAMA_API_KEY` described in the README are temporary operating measures, not substitutes for the code hardening above.
 
-### 2. 原始异常可能进入日志
+### 2. Raw exceptions may enter logs
 
-位置：`ingest.py` 的 `build_index()` 中 `_log(... ({e}))`。
+Location: `_log(... ({e}))` in `build_index()` in `ingest.py`.
 
-异常来自解析器、SDK 或文件读取，可能包含 URL、服务器返回内容或输入片段。不能因为正常日志只输出路径/计数，就保证所有失败路径都不含凭据和家庭文本。
+Exceptions from parsers, the SDK, or file reads may contain URLs, server responses, or input fragments. Normal logs containing only paths/counts do not guarantee that all failure paths exclude credentials and family text.
 
-建议默认记录 run/file ID 与受控错误分类，保持原始异常在本机受保护的诊断渠道；共享日志前脱敏。
+Recommended implementation: log run/file IDs and controlled error categories by default; keep raw exceptions in a protected local diagnostic channel; redact logs before sharing them.
 
-验收：以合成秘密字符串构造 parser/SDK 异常，捕获 stderr 并断言该字符串、认证头和原文没有出现。
+Acceptance criteria: construct parser/SDK exceptions with synthetic secret strings, capture stderr, and assert that those strings, authentication headers, and source text do not appear.
 
-### 3. 启动器尚未验证实际监听接口
+### 3. The launcher does not yet verify actual listening interfaces
 
-当前已有 `run.bat` / `run.ps1` 与 Web UI。`Test-OllamaConfig` 校验 `/api/status` 的 `cloud.disabled`，但访问 `127.0.0.1` 成功不能证明服务仅绑定该接口：一个绑定所有接口的现有服务也能通过此检查。启动器也未移除继承的 API key 或处理代理环境。
+`run.bat` / `run.ps1` and the Web UI already exist. `Test-OllamaConfig` checks `cloud.disabled` at `/api/status`, but successful access through `127.0.0.1` does not prove that the service binds only to that interface: an existing service bound to all interfaces also passes this check. The launcher also does not remove inherited API keys or handle proxy environments.
 
-建议核对 11434 的所有实际 TCP 监听地址与所属进程，只允许约定的 loopback 地址；用合成的监听列表测试通配接口被拒绝。代码之外的 BitLocker、NAS 权限、云同步排除和网络行为仍需运行时验证，不能把目标架构解释为已部署保护。
+Recommended implementation: inspect all actual TCP listening addresses and owning processes for port 11434, permitting only the agreed loopback addresses; test with synthetic listener lists to ensure wildcard interfaces are rejected. Outside the code, BitLocker, NAS permissions, cloud synchronization exclusions, and network behavior still require runtime verification. The target architecture must not be interpreted as deployed protection.
 
-在上述客户端与错误日志加固完成后，再用代表性数据进行本地网络验证。安装模型/依赖的联网阶段与运行阶段分开；运行时允许本地 Ollama 和指定 NAS，禁止意外目的地。
+After client and error-log hardening is complete, verify local network behavior with representative data. Separate online model/dependency installation from runtime; during runtime, allow local Ollama and the specified NAS, and block unintended destinations.
 
-## 本次新增的预防措施
+## Preventive measures added in this review
 
-- `.gitignore` 增加 `.env`、常见私钥/证书容器、凭据 JSON、本地扫描报告；保留无秘密的 `.env.example` / `.env.sample` 模板。
-- 新增 `.github/workflows/secrets.yml`：每次 push/PR 扫描完整可达历史与工作树，固定 scanner 版本、校验下载 SHA、仅授予读权限，checkout 不持久化 Git 凭据；不上传报告。
-- README 明确当前实现、规划能力与未关闭的安全问题，提供本地启动配置。
+- Extended `.gitignore` to cover `.env`, common private key/certificate containers, credential JSON files, and local scan reports; retained secret-free `.env.example` / `.env.sample` templates.
+- Added `.github/workflows/secrets.yml`: scans all reachable history and the working tree on every push/PR; pins the scanner version; verifies the download checksum; grants read-only permissions; prevents checkout from persisting Git credentials; and does not upload reports.
+- Clarified current implementations, planned capabilities, and unresolved security issues in the README, and provided local startup configuration.
 
-忽略规则只防止通常的误添加，不能撤回历史、阻止 `git add -f` 或识别任意命名文件中的秘密。CI 检测在 push 后发生；第一次 push 前仍应在本地扫描。若未来发现真实凭据，应先撤销/轮换，再处理 Git 历史及相关日志，而不只删除当前文件。
+Ignore rules only prevent ordinary accidental additions; they cannot undo history, prevent `git add -f`, or identify secrets in arbitrarily named files. CI detection happens after a push; scan locally before the first push. If real credentials are discovered in the future, revoke/rotate them first, then address Git history and related logs rather than only deleting the current file.
