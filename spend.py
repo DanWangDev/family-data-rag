@@ -21,9 +21,23 @@ SPEND_KINDS = ("consumption", "refund")
 # windowed buckets if statements ever carry thousands of transactions.
 
 
+def _current_rows(alias: str = "t") -> str:
+    """Manual ledger rows have no run; extracted rows follow the live file pointers."""
+    return (
+        f"({alias}.run_id IS NULL OR EXISTS (SELECT 1 FROM files f "
+        f"WHERE f.current_run_id={alias}.run_id AND f.status != 'removed'))"
+    )
+
+
+def _approved_rows(alias: str = "t") -> str:
+    return f"{alias}.status='confirmed' AND {_current_rows(alias)}"
+
+
 def _exclude_confirmed_dups(sql_cond: str = "") -> str:
     return (
-        "t.status = 'confirmed' AND NOT EXISTS (SELECT 1 FROM txn_links l WHERE l.b = t.id AND l.status = 'confirmed')"
+        f"{_approved_rows()} AND NOT EXISTS (SELECT 1 FROM txn_links l "
+        "JOIN transactions kept ON kept.id=l.a WHERE l.b=t.id AND l.status='confirmed' "
+        f"AND {_approved_rows('kept')})"
         + (f" AND {sql_cond}" if sql_cond else "")
     )
 
@@ -67,8 +81,8 @@ def detect_recurring(conn, min_occurrences: int = 2, apply: bool = True) -> list
     groups: dict[tuple, list[str]] = defaultdict(list)
     ids: dict[tuple, list[int]] = defaultdict(list)
     for r in conn.execute(
-        "SELECT id, merchant, amount_minor, scale, currency, date FROM transactions "
-        "WHERE status='confirmed' AND kind='consumption' AND merchant IS NOT NULL AND merchant != ''"
+        "SELECT id, merchant, amount_minor, scale, currency, date FROM transactions t "
+        f"WHERE {_exclude_confirmed_dups()} AND kind='consumption' AND merchant IS NOT NULL AND merchant != ''"
     ):
         key = (r["merchant"].strip().lower(), r["amount_minor"], r["scale"], r["currency"])
         groups[key].append(r["date"])
@@ -143,8 +157,8 @@ def propose_dedup(conn, days: int = 2) -> list[dict]:
     """Candidate duplicates: same merchant+amount+currency within ±days, different files.
     Returns proposed pairs; inserts pending txn_links (idempotent)."""
     rows = conn.execute(
-        "SELECT id, file_id, date, merchant, amount_minor, scale, currency FROM transactions "
-        "WHERE status='confirmed' AND kind='consumption' ORDER BY date"
+        "SELECT id, file_id, date, merchant, amount_minor, scale, currency FROM transactions t "
+        f"WHERE {_approved_rows()} AND kind='consumption' ORDER BY date"
     ).fetchall()
     pairs = []
     for i in range(len(rows)):
@@ -187,27 +201,28 @@ def reconcile(conn, month: str, expected_minor: int, currency: str = "USD") -> d
     if diff != 0:
         parts.append(f"expected {expected_minor}, extracted {extracted}, difference {diff} minor units")
     n_skipped = conn.execute(
-        "SELECT COUNT(*) FROM transactions WHERE status='confirmed' AND currency=? AND strftime('%Y-%m', date)=? AND kind NOT IN ('consumption','refund')",
+        f"SELECT COUNT(*) FROM transactions t WHERE {_approved_rows()} AND currency=? AND strftime('%Y-%m', date)=? AND kind NOT IN ('consumption','refund')",
         (currency, month),
     ).fetchone()[0]
     if n_skipped:
         parts.append(f"{n_skipped} transfer/credit-card-payment row(s) excluded from spend")
     n_dups = conn.execute(
         "SELECT COUNT(*) FROM txn_links l JOIN transactions t ON t.id=l.b "
-        "WHERE t.status='confirmed' AND t.currency=? AND strftime('%Y-%m', t.date)=? AND l.status='pending'",
+        "JOIN transactions kept ON kept.id=l.a "
+        f"WHERE {_approved_rows()} AND {_approved_rows('kept')} AND t.currency=? AND strftime('%Y-%m', t.date)=? AND l.status='pending'",
         (currency, month),
     ).fetchone()[0]
     if n_dups:
         parts.append(f"{n_dups} possible duplicate(s) pending review")
     n_uncat = conn.execute(
-        "SELECT COUNT(*) FROM transactions WHERE status='confirmed' AND currency=? AND strftime('%Y-%m', date)=? AND kind IN ('consumption','refund') "
+        f"SELECT COUNT(*) FROM transactions t WHERE {_exclude_confirmed_dups()} AND currency=? AND strftime('%Y-%m', date)=? AND kind IN ('consumption','refund') "
         "AND (category IS NULL OR category='')",
         (currency, month),
     ).fetchone()[0]
     if n_uncat:
         parts.append(f"{n_uncat} uncategorized transaction(s)")
     n_pending = conn.execute(
-        "SELECT COUNT(*) FROM transactions WHERE status='pending' AND currency=? AND strftime('%Y-%m', date)=?",
+        f"SELECT COUNT(*) FROM transactions t WHERE {_current_rows()} AND status='pending' AND currency=? AND strftime('%Y-%m', date)=?",
         (currency, month),
     ).fetchone()[0]
     if n_pending:
