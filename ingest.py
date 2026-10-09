@@ -10,6 +10,7 @@ import re
 import shutil
 import sqlite3
 import sys
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -31,6 +32,18 @@ def now_iso() -> str:
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr)
+
+
+def _log_failure(cfg: Config, label: str, exc: Exception) -> None:
+    """stderr gets a classification only; the raw exception (which may embed document
+    content, URLs, or server text) goes to a protected diagnostics file inside data/."""
+    _log(f"{label} ({type(exc).__name__})")
+    try:
+        diag = cfg.db_path.parent / "diagnostics.log"
+        with open(diag, "a", encoding="utf-8") as f:
+            f.write(f"{now_iso()} {label}\n{traceback.format_exc()}\n")
+    except OSError:
+        pass  # never let diagnostics logging break the pipeline
 
 
 def sha256_of(path: Path) -> str:
@@ -171,7 +184,7 @@ def build_index(
         db.set_run_state(conn, run_id, "embedded", chunk_count=len(texts))
         db.switch_run(conn, file_id, run_id)
     except Exception as e:
-        _log(f"index failed: {blob_row['blob_path'] if blob_row else version_id} ({e})")
+        _log_failure(cfg, f"index failed: file {file_id} run {run_id}", e)
         db.set_run_state(conn, run_id, "error")
 
 
@@ -323,7 +336,7 @@ def _rebuild_from_chunks(conn, cfg: Config, file_id: int, version_id: int, gen: 
         db.set_run_state(conn, run_id, "embedded", chunk_count=len(texts))
         db.switch_run(conn, file_id, run_id)
     except Exception as e:
-        _log(f"rebuild failed (run {run_id}): {e}")
+        _log_failure(cfg, f"rebuild failed: file {file_id} run {run_id}", e)
         db.set_run_state(conn, run_id, "error")
 
 
