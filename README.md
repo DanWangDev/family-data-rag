@@ -81,6 +81,8 @@ erDiagram
 - **Location evidence**: chunks store page numbers/text ranges, worksheets/row ranges, paragraph ranges, or OCR regions. Internal PDF page numbers currently start at 0; the UI should convert them to user-facing page numbers.
 - **Human judgment**: matching names only create merge candidates; the existence of a citation and the correctness of a relationship are assessed separately. Human corrections act as query/display overrides and are not overwritten by re-extraction.
 
+Corrections are resolved through `effective_entities` for lookup and display. `version_entities` preserves entity IDs when the same content version is re-extracted or rebuilt under a new index generation, including after old index chunks are collected. Different content versions still require identity review; legacy backfill preserves unique mappings and never collapses ambiguous historical duplicates.
+
 Graph data and transactions belong to runs; final queries and statistics are restricted to currently active runs. Current vector tables are named by dimension: `vec_chunks_N` / `vec_staging_N`; configuration generations are recorded separately in `index_meta`. Rebuilds switch one file at a time. If current references span mixed generations, retrieval refuses to run; this does not mean a full database rebuild supports an atomic switch with uninterrupted queries.
 
 ## Ingestion, switching, and deletion
