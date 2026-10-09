@@ -196,18 +196,24 @@ def _write_extraction(conn, run_id: int, merged: Extraction) -> None:
         )
 
     for txn in merged.transactions:
-        if txn.scale not in SCALES:
+        currency = txn.currency.upper()
+        if txn.scale not in SCALES or txn.scale != db.CURRENCY_SCALES.get(currency, txn.scale):
             continue
         try:
             datetime.fromisoformat(txn.date[:10])
         except ValueError:
             continue
         ok_ids = [cid for cid in txn.chunk_ids if cid in valid]
+        if not ok_ids:
+            continue
+        evidence = sorted(set(ok_ids))
+        raw = txn.model_dump()
+        raw["chunk_ids"] = evidence
         conn.execute(
-            "INSERT INTO transactions(file_id, run_id, date, amount_minor, scale, currency, merchant, category, kind, description, raw) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (file_id, run_id, txn.date[:10], txn.amount_minor, txn.scale, txn.currency,
-             txn.merchant, txn.category, txn.kind, txn.description, json.dumps(txn.model_dump(), ensure_ascii=False)),
+            "INSERT INTO transactions(file_id, run_id, date, amount_minor, scale, currency, merchant, category, kind, description, raw, evidence_chunk_ids) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (file_id, run_id, txn.date[:10], txn.amount_minor, txn.scale, currency,
+             txn.merchant, txn.category, txn.kind, txn.description, json.dumps(raw, ensure_ascii=False), json.dumps(evidence)),
         )
 def extract_run(conn, cfg: Config, run_id: int, *, extract_fn=None) -> Extraction:
     """Extract a single run; everything lands pending, evidence-validated, never merged."""

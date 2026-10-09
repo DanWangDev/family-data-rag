@@ -1,5 +1,7 @@
 """app.py — Streamlit UI: chat with citations, files/ingest control. Launched by run.bat (localhost only)."""
 
+import json
+
 import plotly.express as px
 import streamlit as st
 
@@ -149,7 +151,7 @@ with tab_entities:
 
 with tab_spend:
     st.caption(
-        "Reconcile first. Totals are computed in code over extracted transactions — "
+        "Reconcile first. Only human-confirmed transactions enter totals — "
         "refunds subtract, transfers and card payments never count, confirmed duplicates count once."
     )
     by_cat = spend.monthly_by_category(conn)
@@ -207,10 +209,18 @@ with tab_spend:
 
     st.subheader("Review and edit transactions")
     txns = conn.execute(
-        "SELECT id, date, merchant, category, kind, amount_minor, scale, currency, is_recurring, recurrence "
+        "SELECT id, date, merchant, category, kind, amount_minor, scale, currency, status, evidence_chunk_ids, is_recurring, recurrence "
         "FROM transactions ORDER BY date"
     ).fetchall()
     if txns:
+        st.caption("Review source evidence, then change status to confirmed or rejected and save. Pending rows are excluded from analytics.")
+        with st.expander("Transaction source evidence"):
+            evidence_txn = st.selectbox("Transaction", [t["id"] for t in txns])
+            evidence_row = next(t for t in txns if t["id"] == evidence_txn)
+            for cid in json.loads(evidence_row["evidence_chunk_ids"]):
+                chunk = conn.execute("SELECT text FROM chunks WHERE id=?", (cid,)).fetchone()
+                if chunk:
+                    st.text(f"Chunk {cid}: {chunk['text']}")
         edited = st.data_editor(
             [dict(t) for t in txns],
             column_config={
@@ -219,6 +229,9 @@ with tab_spend:
                 "amount_minor": st.column_config.NumberColumn(disabled=True),
                 "scale": st.column_config.NumberColumn(disabled=True),
                 "currency": st.column_config.TextColumn(disabled=True),
+                "evidence_chunk_ids": st.column_config.TextColumn(disabled=True),
+                "status": st.column_config.SelectboxColumn(options=["pending", "confirmed", "rejected"], required=True),
+                "kind": st.column_config.SelectboxColumn(options=["consumption", "refund", "transfer", "credit_card_payment"], required=True),
                 "is_recurring": st.column_config.NumberColumn(disabled=True),
                 "recurrence": st.column_config.TextColumn(disabled=True),
             },
@@ -226,12 +239,18 @@ with tab_spend:
         )
         if st.button("Save edits"):
             by_id = {t["id"]: t for t in txns}
-            for row in edited:
-                orig = by_id[row["id"]]
-                if (row["merchant"], row["category"], row["kind"]) != (orig["merchant"], orig["category"], orig["kind"]):
-                    conn.execute(
-                        "UPDATE transactions SET merchant=?, category=?, kind=? WHERE id=?",
-                        (row["merchant"], row["category"], row["kind"], row["id"]),
-                    )
-            conn.commit()
-            st.rerun()
+            try:
+                with conn:
+                    for row in edited:
+                        orig = by_id[row["id"]]
+                        if row["status"] != orig["status"]:
+                            spend.review_transaction(conn, row["id"], row["status"], commit=False)
+                        if (row["merchant"], row["category"], row["kind"]) != (orig["merchant"], orig["category"], orig["kind"]):
+                            conn.execute(
+                                "UPDATE transactions SET merchant=?, category=?, kind=? WHERE id=?",
+                                (row["merchant"], row["category"], row["kind"], row["id"]),
+                            )
+            except ValueError as e:
+                st.error(str(e))
+            else:
+                st.rerun()
