@@ -6,7 +6,9 @@ no cloud calls.
 
 ## Status
 
-Phase 0: environment setup and baseline.
+Phase 1 complete: versioned ingest (NAS sources + local blob store), hybrid retrieval
+(vector + keyword + graph hooks), chat with citations and honest refusal, backup/restore,
+Streamlit UI. Next: Phase 2 knowledge-graph extraction.
 
 ## Setup
 
@@ -24,8 +26,23 @@ Phase 0: environment setup and baseline.
    ```
 3. Copy `config.toml.example` to `config.toml` and set your source folders.
 
+## Usage
+
+```
+.venv\Scripts\python -m ingest scan        # scan sources, index new/changed files
+.venv\Scripts\python -m ingest status      # index overview
+.venv\Scripts\python -m ingest backup      # WAL-safe snapshot + blob manifest
+.venv\Scripts\python -m ingest restore-test
+.venv\Scripts\python -m selftest           # all checks (model-free)
+run.bat                                    # launch the web UI (localhost only)
+```
+
+Indexed data lives in `data/` (SQLite + content-addressed blobs) — excluded from git and
+cloud sync. Encrypt the volume (BitLocker).
+
 ## Security
 
 Sensitive family data stays local. Ollama binds localhost only, cloud features are
-disabled (`OLLAMA_NO_CLOUD=1`), and `data/` (index + blobs) is excluded from git and
-cloud sync. Encrypt the volume holding `data/` (BitLocker).
+disabled (`OLLAMA_NO_CLOUD=1`, verified at startup by `run.ps1`), and document text is
+treated as data, never instructions. No auth (single-user machine) — LAN access, if ever
+needed, goes through a VPN only.

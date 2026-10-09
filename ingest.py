@@ -481,7 +481,8 @@ def status(conn) -> None:
     vec_live = sum(
         conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]
         for (name,) in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'vec_chunks_%'"
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name GLOB 'vec_chunks_[0-9]*' AND name NOT GLOB 'vec_chunks_[0-9]*_*'"
         )
     )
     for label, sql in (
