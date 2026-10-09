@@ -98,7 +98,7 @@ def check_db_switch_contract() -> None:
             )
             cid = cur.lastrowid
             conn.execute(
-                "INSERT INTO vec_staging(rowid, embedding) VALUES(?,?)",
+                "INSERT INTO vec_staging_4(rowid, embedding) VALUES(?,?)",
                 (cid, json.dumps([0.1, 0.2, 0.3, 0.4])),
             )
             conn.execute("INSERT INTO fts_staging(rowid, text) VALUES(?,?)", (cid, f"chunk {base + i}"))
@@ -106,7 +106,7 @@ def check_db_switch_contract() -> None:
 
     def live_counts() -> tuple[int, int]:
         return (
-            conn.execute("SELECT COUNT(*) FROM vec_chunks").fetchone()[0],
+            conn.execute("SELECT COUNT(*) FROM vec_chunks_4").fetchone()[0],
             conn.execute("SELECT COUNT(*) FROM fts_chunks").fetchone()[0],
         )
 
@@ -127,11 +127,11 @@ def check_db_switch_contract() -> None:
     db.switch_run(conn, a, r2)  # A updates; R1 must stay live for B
     assert live_counts() == (4, 4)
 
-    # scenario 4 (failed switch): FK error -> transaction rolls back, old index intact
+    # scenario 4 (failed switch): nonexistent run -> refused up front, old index intact
     try:
         db.switch_run(conn, a, 9999)
         raise AssertionError("switch to nonexistent run should raise")
-    except sqlite3.IntegrityError:
+    except ValueError:
         pass
     assert conn.execute("SELECT current_run_id FROM files WHERE id=?", (a,)).fetchone()[0] == r2
     assert live_counts() == (4, 4)
@@ -192,7 +192,7 @@ def check_ingest_flow() -> None:
         live_by_run = lambda: {
             r["run_id"]: r["n"]
             for r in conn.execute(
-                "SELECT c.run_id, COUNT(*) AS n FROM vec_chunks v JOIN chunks c ON c.id = v.rowid GROUP BY c.run_id"
+                "SELECT c.run_id, COUNT(*) AS n FROM vec_chunks_4 v JOIN chunks c ON c.id = v.rowid GROUP BY c.run_id"
             )
         }
 
@@ -270,6 +270,30 @@ def check_ingest_flow() -> None:
         assert versions() == 2 and runs() == 2
         assert live_by_run() == {r_v1: 2, r_v3: 2}
 
+        # scenario 4 (generation reindex): same content under a new generation —
+        # embedding-only change reuses chunks; old index stays live until each switch
+        fake5 = lambda model, texts: [[0.25] * 5 for _ in texts]
+        ingest.rebuild(conn, cfg, embed_fn=fake5, dims=5, digest="other-digest")
+        new_runs = [
+            r["run_id"]
+            for r in conn.execute("SELECT DISTINCT c.run_id FROM vec_chunks_5 v JOIN chunks c ON c.id = v.rowid")
+        ]
+        assert len(new_runs) == 2  # a (V1) + b/c sharing one V3 run
+        assert not live_by_run()  # old generation evicted from vec_chunks_4
+        for nr in new_runs:
+            assert conn.execute("SELECT chunk_count FROM index_runs WHERE id=?", (nr,)).fetchone()["chunk_count"] == 2
+
+        # failed rebuild keeps the old index live
+        def failing_embed(model, texts):
+            raise RuntimeError("simulated embed outage")
+
+        ingest.rebuild(conn, cfg, embed_fn=failing_embed, dims=6, digest="broken-digest")
+        still = [
+            r["run_id"]
+            for r in conn.execute("SELECT DISTINCT c.run_id FROM vec_chunks_5 v JOIN chunks c ON c.id = v.rowid")
+        ]
+        assert still == new_runs
+
         # missing share: scan logs and continues, nothing is deleted
         cfg2 = config.Config(source_dirs=(root / "nonexistent",), db_path=root / "family.db",
                              blob_dir=root / "blob", **fake_cfg)
@@ -277,7 +301,8 @@ def check_ingest_flow() -> None:
         assert conn.execute(
             "SELECT status FROM sources WHERE path=?", (str(root / "nonexistent"),)
         ).fetchone()[0] == "missing_on_share"
-        assert live_by_run() == {r_v1: 2, r_v3: 2}
+        # untouched: the new generation's live vectors (2 chunks per run, 2 runs)
+        assert conn.execute("SELECT COUNT(*) FROM vec_chunks_5").fetchone()[0] == 4
         conn.close()
 
 
@@ -320,7 +345,7 @@ def check_retrieve_and_chat() -> None:
         cur = conn.execute("INSERT INTO chunks(run_id, seq, text, page, kind) VALUES(?,?,?,?, 'body')", (run_id, seq, text, seq + 1))
         cid = cur.lastrowid
         chunk_ids.append(cid)
-        conn.execute("INSERT INTO vec_chunks(rowid, embedding) VALUES(?,?)", (cid, json.dumps([0.25] * 4)))
+        conn.execute("INSERT INTO vec_chunks_4(rowid, embedding) VALUES(?,?)", (cid, json.dumps([0.25] * 4)))
         conn.execute("INSERT INTO fts_chunks(rowid, text) VALUES(?,?)", (cid, "electricity bill house march" if seq == 0 else "shopping list groceries"))
     conn.commit()
 
@@ -351,6 +376,68 @@ def check_retrieve_and_chat() -> None:
     assert empty["sources"] == [] and "No relevant documents" in empty["answer"]
 
 
+def check_backup_restore() -> None:
+    """Backup snapshot + manifest + SHA-verified restore drill; GC refuses during backup."""
+    import tempfile
+    from pathlib import Path
+
+    import config
+    import db
+    import ingest
+
+    fake_cfg = dict(
+        max_file_mb=100,
+        photo_captions=False,
+        models=config.Models(chat="qwen3:14b", extract="qwen3:8b", embed="fake-embed", vision="qwen3-vl:8b"),
+    )
+    fake_embed = lambda model, texts: [[0.25] * 4 for _ in texts]
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        src = root / "src"
+        src.mkdir()
+        cfg = config.Config(source_dirs=(src,), db_path=root / "family.db", blob_dir=root / "blob", **fake_cfg)
+        conn = db.connect(str(cfg.db_path))
+        db.init_db(conn, dims=4, embed_model="fake-embed", embed_digest="deadbeef")
+        (src / "a.txt").write_text("alpha " * 200, encoding="utf-8")
+        ingest.scan(conn, cfg, embed_fn=fake_embed, dims=4, digest="deadbeef")
+
+        snap = ingest.backup(conn, cfg.blob_dir)  # dest defaults to blob_dir.parent/backups
+        backups = root / "backups"
+        assert snap.parent == backups and snap.exists()
+        manifests = list(backups.glob("*.manifest.json"))
+        assert len(manifests) == 1
+        manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+        assert manifest["snapshot"] == snap.name
+        assert len(manifest["blobs"]) == 1
+
+        # restore drill passes on a healthy backup
+        assert ingest.restore_test(backups) == []
+
+        # corrupted blob -> flagged
+        blob = backups / "blobs" / manifest["blobs"][0]
+        blob.write_bytes(b"corrupted")
+        problems = ingest.restore_test(backups)
+        assert problems and any("hash mismatch" in p for p in problems)
+
+        # missing blob -> flagged
+        blob.unlink()
+        problems = ingest.restore_test(backups)
+        assert problems and any("missing" in p for p in problems)
+
+        # GC refuses while a backup lock is held
+        lock = backups / "backup.lock"
+        lock.touch()
+        try:
+            ingest.gc(conn, cfg.blob_dir)
+            raise AssertionError("gc should refuse during a backup")
+        except RuntimeError:
+            pass
+        finally:
+            lock.unlink(missing_ok=True)
+        conn.close()
+
+
 def main() -> None:
     check_dep_imports()
     check_sqlite_vec_roundtrip()
@@ -358,6 +445,7 @@ def main() -> None:
     check_db_switch_contract()
     check_ingest_flow()
     check_retrieve_and_chat()
+    check_backup_restore()
     print("selftest: all checks passed")
 
 
