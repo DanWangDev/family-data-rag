@@ -134,7 +134,7 @@ def _write_extraction(conn, run_id: int, merged: Extraction) -> None:
     file_id = file_row["id"] if file_row else None
 
     entity_ids: dict[tuple[str, str], int] = {}
-    name_to_id: dict[str, int] = {}
+    name_to_ids: dict[str, set[int]] = {}
     for ent in merged.entities:
         ok_ids = [cid for cid in ent.chunk_ids if cid in valid]
         if not ok_ids or not any(_norm(ent.name) in _norm(valid[cid]) for cid in ok_ids):
@@ -168,26 +168,25 @@ def _write_extraction(conn, run_id: int, merged: Extraction) -> None:
                 (ent.name, ent.type, canonical, json.dumps(ent.attrs, ensure_ascii=False)),
             )
             entity_ids[key] = cur.lastrowid
-        name_to_id[canonical] = entity_ids[key]
+        name_to_ids.setdefault(canonical, set()).add(entity_ids[key])
         for cid in ok_ids:
             conn.execute("INSERT OR IGNORE INTO chunk_entities(chunk_id, entity_id) VALUES(?,?)", (cid, entity_ids[key]))
 
     for rel in merged.relations:
-        src_id = name_to_id.get(rel.source.lower())
-        if src_id is None:
-            row = conn.execute("SELECT id FROM entities WHERE canonical=? ORDER BY id LIMIT 1", (rel.source.lower(),)).fetchone()
-            src_id = row["id"] if row else None
-        dst_id = name_to_id.get(rel.target.lower())
-        if dst_id is None:
-            row = conn.execute("SELECT id FROM entities WHERE canonical=? ORDER BY id LIMIT 1", (rel.target.lower(),)).fetchone()
-            dst_id = row["id"] if row else None
-        if src_id is None or dst_id is None:
-            continue  # relation mentions an unknown entity — skip, never guess
-        ok_ids = [cid for cid in rel.chunk_ids if cid in valid]
+        sources = name_to_ids.get(rel.source.lower(), set())
+        targets = name_to_ids.get(rel.target.lower(), set())
+        if len(sources) != 1 or len(targets) != 1:
+            continue  # Unknown or ambiguous in this run: never guess another identity.
+        src_id, dst_id = next(iter(sources)), next(iter(targets))
+        ok_ids = sorted({cid for cid in rel.chunk_ids if cid in valid})
+        if not ok_ids or not all(
+            _norm(name) and any(_norm(name) in _norm(valid[cid]) for cid in ok_ids)
+            for name in (rel.source, rel.target)
+        ):
+            continue
         quote_verified = 0
         if rel.quote:
-            q = _norm(rel.quote)
-            if any(q and q in _norm(valid[cid]) for cid in ok_ids):
+            if any(rel.quote in valid[cid] for cid in ok_ids):
                 quote_verified = 1
         conn.execute(
             "INSERT INTO relations(src, dst, rel, run_id, evidence_chunk_ids, quote, valid_from, valid_to, quote_verified, status) "
