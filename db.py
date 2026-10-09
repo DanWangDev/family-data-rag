@@ -59,7 +59,9 @@ CREATE TABLE IF NOT EXISTS files(
   name TEXT NOT NULL,
   kind TEXT NOT NULL,
   ext TEXT,
-  current_run_id INTEGER REFERENCES index_runs(id),
+  current_version_id INTEGER REFERENCES file_versions(id),  -- content pointer (scan sets it)
+  current_run_id INTEGER REFERENCES index_runs(id),         -- index pointer (switch sets it)
+  scan_seen_at TEXT,
   exif_date TEXT,
   status TEXT NOT NULL DEFAULT 'new',      -- new|copied|embedded|extracted|error|missing_on_source|removed
   meta TEXT,
@@ -277,6 +279,10 @@ def switch_run(conn: sqlite3.Connection, file_id: int, new_run_id: int) -> None:
 
     Single BEGIN IMMEDIATE transaction — also the write lock that serializes
     ingest switches against backup snapshots and GC.
+
+    Staging rows are DURABLE (vectors live there once embedded); live tables are the
+    queryable projection. An evicted run keeps its staging rows, so a later file with
+    the same content can re-promote it without re-embedding.
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -285,15 +291,15 @@ def switch_run(conn: sqlite3.Connection, file_id: int, new_run_id: int) -> None:
 
         chunk_sel = "SELECT id FROM chunks WHERE run_id=?"
         conn.execute(
-            f"INSERT INTO vec_chunks(rowid, embedding) SELECT rowid, embedding FROM vec_staging WHERE rowid IN ({chunk_sel})",
+            f"INSERT INTO vec_chunks(rowid, embedding) SELECT rowid, embedding FROM vec_staging "
+            f"WHERE rowid IN ({chunk_sel}) AND rowid NOT IN (SELECT rowid FROM vec_chunks)",
             (new_run_id,),
         )
         conn.execute(
-            f"INSERT INTO fts_chunks(rowid, text) SELECT rowid, text FROM fts_staging WHERE rowid IN ({chunk_sel})",
+            f"INSERT INTO fts_chunks(rowid, text) SELECT rowid, text FROM fts_staging "
+            f"WHERE rowid IN ({chunk_sel}) AND rowid NOT IN (SELECT rowid FROM fts_chunks)",
             (new_run_id,),
         )
-        conn.execute("DELETE FROM vec_staging WHERE rowid IN (SELECT id FROM chunks WHERE run_id=?)", (new_run_id,))
-        conn.execute("DELETE FROM fts_staging WHERE rowid IN (SELECT id FROM chunks WHERE run_id=?)", (new_run_id,))
 
         conn.execute(
             "UPDATE files SET current_run_id=?, status='embedded', updated_at=datetime('now') WHERE id=?",
@@ -322,6 +328,19 @@ def remove_file(conn: sqlite3.Connection, file_id: int) -> None:
         raise
 
 
+def delete_run_rows(conn: sqlite3.Connection, run_id: int) -> None:
+    """Delete every index artifact of a run: chunks, live+staging vec/fts, graph, transactions, the run row."""
+    conn.execute("DELETE FROM chunk_entities WHERE chunk_id IN (SELECT id FROM chunks WHERE run_id=?)", (run_id,))
+    conn.execute("DELETE FROM relations WHERE run_id=?", (run_id,))
+    conn.execute("DELETE FROM transactions WHERE run_id=?", (run_id,))
+    conn.execute("DELETE FROM vec_chunks WHERE rowid IN (SELECT id FROM chunks WHERE run_id=?)", (run_id,))
+    conn.execute("DELETE FROM fts_chunks WHERE rowid IN (SELECT id FROM chunks WHERE run_id=?)", (run_id,))
+    conn.execute("DELETE FROM vec_staging WHERE rowid IN (SELECT id FROM chunks WHERE run_id=?)", (run_id,))
+    conn.execute("DELETE FROM fts_staging WHERE rowid IN (SELECT id FROM chunks WHERE run_id=?)", (run_id,))
+    conn.execute("DELETE FROM chunks WHERE run_id=?", (run_id,))
+    conn.execute("DELETE FROM index_runs WHERE id=?", (run_id,))
+
+
 def purge_version(conn: sqlite3.Connection, version_id: int) -> list[str]:
     """Purge CONTENT entirely. Refuses while any file references it or a run is in-flight.
     Returns blob paths the caller should unlink from disk."""
@@ -329,7 +348,7 @@ def purge_version(conn: sqlite3.Connection, version_id: int) -> list[str]:
         """
         SELECT f.id, f.source_path FROM files f
         JOIN index_runs r ON r.id = f.current_run_id
-        WHERE r.version_id = ?
+        WHERE r.version_id = ? AND f.status != 'removed'
         """,
         (version_id,),
     ).fetchall()
@@ -346,17 +365,17 @@ def purge_version(conn: sqlite3.Connection, version_id: int) -> list[str]:
 
     conn.execute("BEGIN IMMEDIATE")
     try:
+        # removed files tied to this content become tombstones (pointers cleared, row kept)
+        # so future scans never re-import the purged source; retrieval ignores them.
+        conn.execute(
+            "UPDATE files SET current_run_id=NULL, current_version_id=NULL "
+            "WHERE status='removed' AND (current_run_id IN "
+            "(SELECT id FROM index_runs WHERE version_id=?) OR current_version_id=?)",
+            (version_id, version_id),
+        )
         run_ids = [r["id"] for r in conn.execute("SELECT id FROM index_runs WHERE version_id=?", (version_id,))]
         for run_id in run_ids:
-            conn.execute("DELETE FROM chunk_entities WHERE chunk_id IN (SELECT id FROM chunks WHERE run_id=?)", (run_id,))
-            conn.execute("DELETE FROM relations WHERE run_id=?", (run_id,))
-            conn.execute("DELETE FROM transactions WHERE run_id=?", (run_id,))
-            conn.execute("DELETE FROM vec_chunks WHERE rowid IN (SELECT id FROM chunks WHERE run_id=?)", (run_id,))
-            conn.execute("DELETE FROM fts_chunks WHERE rowid IN (SELECT id FROM chunks WHERE run_id=?)", (run_id,))
-            conn.execute("DELETE FROM vec_staging WHERE rowid IN (SELECT id FROM chunks WHERE run_id=?)", (run_id,))
-            conn.execute("DELETE FROM fts_staging WHERE rowid IN (SELECT id FROM chunks WHERE run_id=?)", (run_id,))
-            conn.execute("DELETE FROM chunks WHERE run_id=?", (run_id,))
-        conn.execute("DELETE FROM index_runs WHERE version_id=?", (version_id,))
+            delete_run_rows(conn, run_id)
         blob_paths = [
             r["blob_path"]
             for r in conn.execute("SELECT blob_path FROM file_versions WHERE id=?", (version_id,))
