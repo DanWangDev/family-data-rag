@@ -90,15 +90,13 @@ def _chunk(parsed: parsers.Parsed) -> tuple[list[str], list[int | None], list[st
     kinds: list[str] = []
     positions: list[str | None] = []
     for seg in parsed.segments:
-        parts = textutil.split_text(seg.text, target=CHUNK_TARGET, overlap=CHUNK_OVERLAP)
-        prev = 0
-        for part in parts:
+        spans = textutil.split_text_spans(seg.text, target=CHUNK_TARGET, overlap=CHUNK_OVERLAP)
+        for start, end in spans:
+            part = seg.text[start:end]
             if not part.strip():
                 continue
             if seg.position and "page" in seg.position and seg.kind == "body":
-                start = seg.text.index(part, prev)
-                pos = {"page": seg.page, "char_range": [start, start + len(part)]}
-                prev = start + len(part)
+                pos = {"page": seg.page, "char_range": [start, end]}
             else:
                 pos = seg.position
             texts.append(part)

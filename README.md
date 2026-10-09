@@ -185,6 +185,8 @@ Current workspace CLI (in development):
 
 `parse` retries files whose current content has not been successfully indexed; `rebuild` reindexes according to configuration. `remove <path>`, `purge <sha256>`, and `gc` modify data. Current CLI initialization probes embedding dimensions and lists models, so `status` / `restore-test` also require local Ollama.
 
+The PDF overlap fix adds `position_version: 2` to the chunk configuration. After upgrading an existing index, run `.\.venv\Scripts\python.exe -m ingest rebuild` to regenerate citation offsets from the stored blobs. Retrieval refuses the old configuration until rebuilding completes; source files do not need to be available on the NAS.
+
 `run.bat` calls `run.ps1`, configures the local environment, checks cloud-disabled status, and starts Streamlit bound to `127.0.0.1:8501`. It may stop existing Ollama instances. Failed checks block startup by default; `--skip-check` bypasses this protection. The launcher does not yet remove inherited API keys, disable proxies, or verify actual listening interfaces.
 
 ## Credentials and privacy

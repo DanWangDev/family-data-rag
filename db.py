@@ -14,7 +14,7 @@ import json
 import sqlite3
 
 PARSER_VERSION = "1"  # bump when a parser's output shape changes
-CHUNK_CONFIG = json.dumps({"target_chars": 1000, "overlap_chars": 150})
+CHUNK_CONFIG = json.dumps({"target_chars": 1000, "overlap_chars": 150, "position_version": 2})
 CURRENCY_SCALES = {"USD": 100, "CNY": 100, "GBP": 100, "EUR": 100, "JPY": 1}
 
 # Valid reference for a run: every files.status EXCEPT 'removed' — 'new'/'embedded'/'extracted'/
