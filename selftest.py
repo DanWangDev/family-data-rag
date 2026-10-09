@@ -660,8 +660,8 @@ def check_spend() -> None:
 
     def add(date, minor, scale=100, currency="USD", merchant="", category="", kind="consumption", file_id=None):
         cur = conn.execute(
-            "INSERT INTO transactions(file_id, date, amount_minor, scale, currency, merchant, category, kind) "
-            "VALUES(?,?,?,?,?,?,?,?)",
+            "INSERT INTO transactions(file_id, date, amount_minor, scale, currency, merchant, category, kind, status) "
+            "VALUES(?,?,?,?,?,?,?,?, 'confirmed')",
             (file_id, date, minor, scale, currency, merchant, category, kind),
         )
         conn.commit()

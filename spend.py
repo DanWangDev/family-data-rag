@@ -9,6 +9,7 @@ All math is SQL/code; the LLM never computes money. Contract (plan v3):
 """
 
 from collections import defaultdict
+import json
 from datetime import datetime, timedelta
 from statistics import fmean, linear_regression, median
 
@@ -22,7 +23,7 @@ SPEND_KINDS = ("consumption", "refund")
 
 def _exclude_confirmed_dups(sql_cond: str = "") -> str:
     return (
-        "NOT EXISTS (SELECT 1 FROM txn_links l WHERE l.b = t.id AND l.status = 'confirmed')"
+        "t.status = 'confirmed' AND NOT EXISTS (SELECT 1 FROM txn_links l WHERE l.b = t.id AND l.status = 'confirmed')"
         + (f" AND {sql_cond}" if sql_cond else "")
     )
 
@@ -67,7 +68,7 @@ def detect_recurring(conn, min_occurrences: int = 2, apply: bool = True) -> list
     ids: dict[tuple, list[int]] = defaultdict(list)
     for r in conn.execute(
         "SELECT id, merchant, amount_minor, scale, currency, date FROM transactions "
-        "WHERE kind='consumption' AND merchant IS NOT NULL AND merchant != ''"
+        "WHERE status='confirmed' AND kind='consumption' AND merchant IS NOT NULL AND merchant != ''"
     ):
         key = (r["merchant"].strip().lower(), r["amount_minor"], r["scale"], r["currency"])
         groups[key].append(r["date"])
@@ -143,7 +144,7 @@ def propose_dedup(conn, days: int = 2) -> list[dict]:
     Returns proposed pairs; inserts pending txn_links (idempotent)."""
     rows = conn.execute(
         "SELECT id, file_id, date, merchant, amount_minor, scale, currency FROM transactions "
-        "WHERE kind='consumption' ORDER BY date"
+        "WHERE status='confirmed' AND kind='consumption' ORDER BY date"
     ).fetchall()
     pairs = []
     for i in range(len(rows)):
@@ -186,27 +187,52 @@ def reconcile(conn, month: str, expected_minor: int, currency: str = "USD") -> d
     if diff != 0:
         parts.append(f"expected {expected_minor}, extracted {extracted}, difference {diff} minor units")
     n_skipped = conn.execute(
-        "SELECT COUNT(*) FROM transactions WHERE strftime('%Y-%m', date)=? AND kind NOT IN ('consumption','refund')",
-        (month,),
+        "SELECT COUNT(*) FROM transactions WHERE status='confirmed' AND currency=? AND strftime('%Y-%m', date)=? AND kind NOT IN ('consumption','refund')",
+        (currency, month),
     ).fetchone()[0]
     if n_skipped:
         parts.append(f"{n_skipped} transfer/credit-card-payment row(s) excluded from spend")
     n_dups = conn.execute(
         "SELECT COUNT(*) FROM txn_links l JOIN transactions t ON t.id=l.b "
-        "WHERE strftime('%Y-%m', t.date)=? AND l.status='pending'",
-        (month,),
+        "WHERE t.status='confirmed' AND t.currency=? AND strftime('%Y-%m', t.date)=? AND l.status='pending'",
+        (currency, month),
     ).fetchone()[0]
     if n_dups:
         parts.append(f"{n_dups} possible duplicate(s) pending review")
     n_uncat = conn.execute(
-        "SELECT COUNT(*) FROM transactions WHERE strftime('%Y-%m', date)=? AND kind IN ('consumption','refund') "
+        "SELECT COUNT(*) FROM transactions WHERE status='confirmed' AND currency=? AND strftime('%Y-%m', date)=? AND kind IN ('consumption','refund') "
         "AND (category IS NULL OR category='')",
-        (month,),
+        (currency, month),
     ).fetchone()[0]
     if n_uncat:
         parts.append(f"{n_uncat} uncategorized transaction(s)")
+    n_pending = conn.execute(
+        "SELECT COUNT(*) FROM transactions WHERE status='pending' AND currency=? AND strftime('%Y-%m', date)=?",
+        (currency, month),
+    ).fetchone()[0]
+    if n_pending:
+        parts.append(f"{n_pending} transaction(s) pending review, excluded from totals")
     return {
         "month": month, "currency": currency,
         "expected_minor": expected_minor, "extracted_minor": extracted,
         "difference_minor": diff, "explanation": "; ".join(parts) or "totals match",
     }
+
+
+def review_transaction(conn, transaction_id: int, status: str, *, commit: bool = True) -> None:
+    """Human review cannot confirm an extracted row without valid source evidence."""
+    if status not in {"pending", "confirmed", "rejected"}:
+        raise ValueError("Invalid transaction review status")
+    row = conn.execute("SELECT * FROM transactions WHERE id=?", (transaction_id,)).fetchone()
+    if not row:
+        raise ValueError("Unknown transaction")
+    if status == "confirmed" and row["run_id"] is not None:
+        ids = json.loads(row["evidence_chunk_ids"])
+        valid = {r["id"] for r in conn.execute("SELECT id FROM chunks WHERE run_id=?", (row["run_id"],))}
+        if not ids or any(type(cid) is not int or cid not in valid for cid in ids):
+            raise ValueError("Cannot confirm a transaction without valid run-local evidence")
+        if row["scale"] != db.CURRENCY_SCALES.get(row["currency"], row["scale"]):
+            raise ValueError("Currency scale does not match")
+    conn.execute("UPDATE transactions SET status=? WHERE id=?", (status, transaction_id))
+    if commit:
+        conn.commit()

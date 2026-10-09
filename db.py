@@ -15,6 +15,7 @@ import sqlite3
 
 PARSER_VERSION = "1"  # bump when a parser's output shape changes
 CHUNK_CONFIG = json.dumps({"target_chars": 1000, "overlap_chars": 150})
+CURRENCY_SCALES = {"USD": 100, "CNY": 100, "GBP": 100, "EUR": 100, "JPY": 1}
 
 # Valid reference for a run: every files.status EXCEPT 'removed' — 'new'/'embedded'/'extracted'/
 # 'error'/'missing_on_source' all keep their index queryable (missing_on_source = NAS-offline rule).
@@ -141,6 +142,8 @@ CREATE TABLE IF NOT EXISTS transactions(
   kind TEXT NOT NULL DEFAULT 'consumption', -- consumption|refund|transfer|credit_card_payment
   description TEXT,
   raw TEXT,
+  evidence_chunk_ids TEXT NOT NULL DEFAULT '[]',
+  status TEXT NOT NULL DEFAULT 'pending', -- pending|confirmed|rejected
   is_recurring INTEGER NOT NULL DEFAULT 0,
   recurrence TEXT
 );
@@ -207,6 +210,7 @@ def run_vec_names(conn: sqlite3.Connection, run_id: int) -> tuple[str, str]:
 def init_db(conn: sqlite3.Connection, *, dims: int, embed_model: str, embed_digest: str) -> int:
     """Create tables (vec dims fixed at creation) and the first index_meta row. Returns generation id."""
     conn.executescript(SCHEMA)
+    migrate_transaction_review(conn)
     ensure_vec_tables(conn, dims)
     conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(text)")
     conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS fts_staging USING fts5(text)")
@@ -215,6 +219,25 @@ def init_db(conn: sqlite3.Connection, *, dims: int, embed_model: str, embed_dige
         conn, parser_version=PARSER_VERSION, chunk_config=CHUNK_CONFIG,
         embed_model=embed_model, embed_digest=embed_digest, dims=dims,
     )
+
+
+def migrate_transaction_review(conn: sqlite3.Connection) -> None:
+    """Existing model rows require review too; retain only real run-local evidence."""
+    columns = {r["name"] for r in conn.execute("PRAGMA table_info(transactions)")}
+    if "status" not in columns:
+        conn.execute("ALTER TABLE transactions ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'")
+    if "evidence_chunk_ids" not in columns:
+        conn.execute("ALTER TABLE transactions ADD COLUMN evidence_chunk_ids TEXT NOT NULL DEFAULT '[]'")
+        for row in conn.execute("SELECT id, run_id, raw FROM transactions").fetchall():
+            try:
+                raw = json.loads(row["raw"] or "{}")
+                ids = raw.get("chunk_ids", []) if isinstance(raw, dict) else []
+            except (TypeError, ValueError):
+                ids = []
+            valid = {r["id"] for r in conn.execute("SELECT id FROM chunks WHERE run_id=?", (row["run_id"],))}
+            evidence = sorted({cid for cid in ids if type(cid) is int and cid in valid}) if isinstance(ids, list) else []
+            conn.execute("UPDATE transactions SET evidence_chunk_ids=? WHERE id=?", (json.dumps(evidence), row["id"]))
+    conn.commit()
 
 
 def get_or_create_generation(
