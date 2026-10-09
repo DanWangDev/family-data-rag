@@ -159,11 +159,126 @@ def check_db_switch_contract() -> None:
         raise AssertionError("purge of a referenced version should raise")
     except ValueError:
         pass
-    db.remove_file(conn, c)
-    # removed files keep their pointer as audit trail; GC clears their rows first, then purge proceeds
-    conn.execute("DELETE FROM files WHERE status='removed'")
-    conn.commit()
-    db.purge_version(conn, v2)
+    db.remove_file(conn, c)  # removed rows are audit trail, not blockers
+    db.purge_version(conn, v2)  # clears removed rows, runs, version in one transaction
+
+
+def check_ingest_flow() -> None:
+    """CI scenarios 1-3 + idempotence + rename dedup + re-promotion + remove/purge/gc at the ingest layer."""
+    import tempfile
+    from pathlib import Path
+
+    import config
+    import db
+    import ingest
+
+    fake_cfg = dict(
+        max_file_mb=100,
+        photo_captions=False,
+        models=config.Models(chat="qwen3:14b", extract="qwen3:8b", embed="fake-embed", vision="qwen3-vl:8b"),
+    )
+    fake_embed = lambda model, texts: [[0.25] * 4 for _ in texts]
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        src = root / "src"
+        src.mkdir()
+        cfg = config.Config(source_dirs=(src,), db_path=root / "family.db", blob_dir=root / "blob", **fake_cfg)
+        conn = db.connect(str(cfg.db_path))
+        db.init_db(conn, dims=4, embed_model="fake-embed", embed_digest="deadbeef")
+
+        versions = lambda: conn.execute("SELECT COUNT(*) FROM file_versions").fetchone()[0]
+        runs = lambda: conn.execute("SELECT COUNT(*) FROM index_runs").fetchone()[0]
+        live_by_run = lambda: {
+            r["run_id"]: r["n"]
+            for r in conn.execute(
+                "SELECT c.run_id, COUNT(*) AS n FROM vec_chunks v JOIN chunks c ON c.id = v.rowid GROUP BY c.run_id"
+            )
+        }
+
+        def write(name: str, content: str) -> None:
+            (src / name).write_text(content, encoding="utf-8")
+
+        def scan() -> None:
+            ingest.scan(conn, cfg, embed_fn=fake_embed, dims=4, digest="deadbeef")
+
+        # identical A and B -> one version, one run, both queryable
+        write("a.txt", "alpha " * 200)
+        write("b.txt", "alpha " * 200)
+        scan()
+        assert versions() == 1 and runs() == 1, f"v={versions()} r={runs()}"
+        r_v1 = next(iter(live_by_run()))
+        assert live_by_run() == {r_v1: 2}
+
+        # duplicate import idempotence
+        scan()
+        assert versions() == 1 and runs() == 1 and live_by_run() == {r_v1: 2}
+
+        # scenario 1: A changes -> B still queryable on V1
+        write("a.txt", "beta " * 200)
+        scan()
+        assert versions() == 2 and runs() == 2
+        r_v2 = [r for r in live_by_run() if r != r_v1][0]
+        assert set(live_by_run()) == {r_v1, r_v2}
+        n_v1 = live_by_run()[r_v1]
+        assert live_by_run()[r_v2] > 0
+
+        # scenario 2: B also changes -> V1 evicted immediately, before any GC
+        write("b.txt", "gamma " * 200)
+        scan()
+        assert versions() == 3 and runs() == 3
+        r_v3 = [r for r in live_by_run() if r not in (r_v1, r_v2)][0]
+        assert set(live_by_run()) == {r_v2, r_v3}
+
+        # rename with identical content -> no new version/run (dedup by content, not path)
+        write("c.txt", "gamma " * 200)
+        scan()
+        assert versions() == 3 and runs() == 3
+
+        # re-promotion: A returns to V1's content -> durable staging rows go live again,
+        # no re-embed; A's old run (V2) loses its last reference and is evicted in the same switch
+        write("a.txt", "alpha " * 200)
+        scan()
+        assert versions() == 3 and runs() == 3
+        assert set(live_by_run()) == {r_v1, r_v3}
+        assert live_by_run()[r_v1] == n_v1
+
+        # remove a source: its run evicts only when it loses its last valid reference
+        write("d.txt", "delta " * 200)
+        scan()
+        assert versions() == 4 and runs() == 4
+        r_v4 = [r for r in live_by_run() if r not in (r_v1, r_v3)][0]
+        ingest.remove_source(conn, str(src / "d.txt"))
+        assert live_by_run() == {r_v1: 2, r_v3: 2}
+
+        # purge content: removed rows are audit trail, not blockers -> succeeds immediately
+        sha_d = conn.execute(
+            "SELECT v.sha256 FROM file_versions v JOIN files f ON f.current_version_id=v.id WHERE f.source_path=?",
+            (str(src / "d.txt"),),
+        ).fetchone()[0]
+        ingest.purge_content(conn, cfg.blob_dir, sha_d)
+        assert versions() == 3 and runs() == 3
+        assert live_by_run() == {r_v1: 2, r_v3: 2}
+
+        # gc: collects orphan run V2 (A moved back to V1) and the removed-file version V5
+        write("e.txt", "epsilon " * 200)
+        scan()
+        assert versions() == 4
+        ingest.remove_source(conn, str(src / "e.txt"))
+        removed_blobs = ingest.gc(conn, cfg.blob_dir)
+        assert removed_blobs == 2  # V2's blob + e's blob
+        assert versions() == 2 and runs() == 2
+        assert live_by_run() == {r_v1: 2, r_v3: 2}
+
+        # missing share: scan logs and continues, nothing is deleted
+        cfg2 = config.Config(source_dirs=(root / "nonexistent",), db_path=root / "family.db",
+                             blob_dir=root / "blob", **fake_cfg)
+        ingest.scan(conn, cfg2, embed_fn=fake_embed, dims=4, digest="deadbeef")
+        assert conn.execute(
+            "SELECT status FROM sources WHERE path=?", (str(root / "nonexistent"),)
+        ).fetchone()[0] == "missing_on_share"
+        assert live_by_run() == {r_v1: 2, r_v3: 2}
+        conn.close()
 
 
 def main() -> None:
@@ -171,6 +286,7 @@ def main() -> None:
     check_sqlite_vec_roundtrip()
     check_ocr_roundtrip()
     check_db_switch_contract()
+    check_ingest_flow()
     print("selftest: all checks passed")
 
 
