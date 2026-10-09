@@ -85,7 +85,7 @@ CREATE TABLE IF NOT EXISTS entities(
   name TEXT NOT NULL,
   type TEXT NOT NULL,                      -- person|org|property|policy|vendor|event|account|document|other
   canonical TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending',  -- pending|confirmed|conflicting
+  status TEXT NOT NULL DEFAULT 'pending',  -- pending|confirmed|rejected|conflicting
   attrs TEXT
 );
 CREATE TABLE IF NOT EXISTS aliases(
@@ -112,7 +112,7 @@ CREATE TABLE IF NOT EXISTS relations(
   valid_from TEXT,
   valid_to TEXT,
   quote_verified INTEGER NOT NULL DEFAULT 0,
-  status TEXT NOT NULL DEFAULT 'pending'   -- pending|confirmed|conflicting
+  status TEXT NOT NULL DEFAULT 'pending'   -- pending|confirmed|rejected|conflicting
 );
 CREATE TABLE IF NOT EXISTS chunk_entities(
   chunk_id INTEGER NOT NULL REFERENCES chunks(id),
@@ -178,6 +178,40 @@ def connect(path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+
+def review_fact(conn: sqlite3.Connection, kind: str, fact_id: int, status: str) -> None:
+    """Human confirmation/rejection, with provenance checks before confirmation."""
+    if kind not in {"entity", "relation"} or status not in {"pending", "confirmed", "rejected"}:
+        raise ValueError("Invalid fact review")
+    table = "entities" if kind == "entity" else "relations"
+    row = conn.execute(f"SELECT * FROM {table} WHERE id=?", (fact_id,)).fetchone()
+    if not row:
+        raise ValueError("Unknown fact")
+    if status == "confirmed":
+        queryable = set(queryable_run_ids(conn))
+        if kind == "entity":
+            runs = {r[0] for r in conn.execute(
+                "SELECT c.run_id FROM chunk_entities ce JOIN chunks c ON c.id=ce.chunk_id WHERE ce.entity_id=?",
+                (fact_id,),
+            )}
+            if not runs & queryable:
+                raise ValueError("Entity has no queryable source evidence")
+        else:
+            ids = json.loads(row["evidence_chunk_ids"] or "[]")
+            valid = {r[0] for r in conn.execute("SELECT id FROM chunks WHERE run_id=?", (row["run_id"],))}
+            if row["run_id"] not in queryable or not ids or any(type(cid) is not int or cid not in valid for cid in ids):
+                raise ValueError("Relation has no valid queryable source evidence")
+            if conn.execute("SELECT COUNT(*) FROM entities WHERE id IN (?,?) AND status='rejected'", (row["src"], row["dst"])).fetchone()[0]:
+                raise ValueError("Cannot confirm a relation with a rejected endpoint")
+            for endpoint in {row["src"], row["dst"]}:
+                if not conn.execute(
+                    "SELECT 1 FROM chunk_entities ce JOIN chunks c ON c.id=ce.chunk_id "
+                    "WHERE ce.entity_id=? AND c.run_id=? LIMIT 1", (endpoint, row["run_id"]),
+                ).fetchone():
+                    raise ValueError("Relation endpoint has no evidence in this run")
+    conn.execute(f"UPDATE {table} SET status=? WHERE id=?", (status, fact_id))
+    conn.commit()
 
 
 def vec_names(dims: int) -> tuple[str, str]:
