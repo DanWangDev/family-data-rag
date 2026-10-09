@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Runtime data (sensitive — never commit, never sync to cloud)
+data/
+
+# Local config
+config.toml
+
+# OS
+Thumbs.db
+Desktop.ini

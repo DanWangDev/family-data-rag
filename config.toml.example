@@ -1,0 +1,18 @@
+# Copy to config.toml and edit. config.toml is gitignored (paths are personal).
+
+# Source folders to scan (NAS UNC paths or local dirs)
+source_dirs = ["\\\\nas\\FamilyDocs", "G:\\Scans"]
+
+# Local storage
+db_path = "data/family.db"
+blob_dir = "data/blob"
+
+# Ingest limits
+max_file_mb = 100
+photo_captions = false   # VLM captions for photos (slow batch job)
+
+[models]
+chat = "qwen3:14b"
+extract = "qwen3:8b"
+embed = "nomic-embed-text"
+vision = "qwen3-vl:8b"

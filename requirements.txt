@@ -1,0 +1,11 @@
+streamlit==1.65.0
+ollama
+sqlite-vec==0.1.9
+pymupdf
+python-docx
+openpyxl
+rapidocr==3.10.0
+onnxruntime==1.31.0
+pillow
+plotly
+jieba
