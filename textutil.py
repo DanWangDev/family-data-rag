@@ -10,9 +10,16 @@ def segment(text: str) -> str:
 
 def split_text(text: str, *, target: int = 1000, overlap: int = 150) -> list[str]:
     """Split into ~target-char windows with overlap; backs off to a newline near the edge."""
+    return [text[start:end] for start, end in split_text_spans(text, target=target, overlap=overlap)]
+
+
+def split_text_spans(text: str, *, target: int = 1000, overlap: int = 150) -> list[tuple[int, int]]:
+    """Return the original offsets directly, including for repeated/overlapping text."""
+    if target <= 0 or not 0 <= overlap < target:
+        raise ValueError("Require target > 0 and 0 <= overlap < target")
     if len(text) <= target:
-        return [text]
-    parts: list[str] = []
+        return [(0, len(text))]
+    spans: list[tuple[int, int]] = []
     start = 0
     while start < len(text):
         end = min(start + target, len(text))
@@ -20,8 +27,8 @@ def split_text(text: str, *, target: int = 1000, overlap: int = 150) -> list[str
             nl = text.rfind("\n", start + int(target * 0.7), end)
             if nl > start:
                 end = nl + 1
-        parts.append(text[start:end])
+        spans.append((start, end))
         if end >= len(text):
             break
-        start = end - overlap
-    return parts
+        start = max(start + 1, end - overlap)
+    return spans
