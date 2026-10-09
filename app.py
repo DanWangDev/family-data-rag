@@ -39,7 +39,7 @@ with tab_chat:
                 with st.expander("Sources"):
                     for i, s in enumerate(msg["sources"], start=1):
                         st.markdown(
-                            f"**[{i}] {s['name']}** — page {s['page'] if s['page'] is not None else 'n/a'} "
+                            f"**[{i}] {s['name']}** — page {s['page'] + 1 if s['page'] is not None else 'n/a'} "
                             f"(`{s['source_path']}`)"
                         )
                         st.text(s["text"])
