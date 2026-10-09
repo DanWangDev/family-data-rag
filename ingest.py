@@ -520,6 +520,7 @@ def main(argv=None) -> None:
     sub.add_parser("gc")
     sub.add_parser("backup")
     sub.add_parser("rebuild")
+    sub.add_parser("extract")
     rt = sub.add_parser("restore-test")
     rt.add_argument("backup_dir", nargs="?")
     args = p.parse_args(argv)
@@ -547,6 +548,10 @@ def main(argv=None) -> None:
         print(f"backup: {backup(conn, cfg.blob_dir)}")
     elif args.cmd == "rebuild":
         rebuild(conn, cfg)
+    elif args.cmd == "extract":
+        import extract
+
+        print(f"extract: processed {extract.extract_all(conn, cfg)} runs")
     elif args.cmd == "restore-test":
         dest = Path(args.backup_dir) if args.backup_dir else cfg.blob_dir.parent / "backups"
         problems = restore_test(dest)
