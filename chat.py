@@ -19,7 +19,7 @@ SYSTEM = (
 
 def build_prompt(query: str, chunks: list[dict]) -> list[dict]:
     context = "\n\n".join(
-        f"[{i + 1}] (source: {c['name']}, page {c['page'] if c['page'] is not None else 'n/a'})\n{c['text']}"
+        f"[{i + 1}] (source: {c['name']}, page {c['page'] + 1 if c['page'] is not None else 'n/a'})\n{c['text']}"
         for i, c in enumerate(chunks)
     )
     user = (

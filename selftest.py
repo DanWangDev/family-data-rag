@@ -438,6 +438,61 @@ def check_backup_restore() -> None:
         conn.close()
 
 
+def check_client_hardening() -> None:
+    """Security review item 1: hostile env (remote host, API key, proxy) must not
+    influence the client — pinned loopback, no proxies, no inherited Authorization."""
+    import os
+
+    import models
+
+    saved = {k: os.environ.get(k) for k in ("OLLAMA_HOST", "OLLAMA_API_KEY", "HTTP_PROXY")}
+    try:
+        os.environ["OLLAMA_HOST"] = "http://evil.example.com:9999"
+        os.environ["OLLAMA_API_KEY"] = "sk-synthetic-secret-1234"
+        os.environ["HTTP_PROXY"] = "http://proxy.example.com:8080"
+        client = models._client()  # raises if an Authorization header survives
+        assert str(client._client.base_url).startswith("http://127.0.0.1:11434")
+        assert client._client.trust_env is False
+        assert not any("authorization" in k.lower() for k in client._client.headers)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def check_error_log_redaction() -> None:
+    """Security review item 2: raw exceptions (which may embed document content or
+    credentials) never reach stderr; they go to the protected diagnostics file only."""
+    import contextlib
+    import io
+    import tempfile
+    from pathlib import Path
+
+    import config
+    import ingest
+
+    secret = "sk-synthetic-secret-9999"
+    with tempfile.TemporaryDirectory() as td:
+        cfg = config.Config(
+            source_dirs=(), db_path=Path(td) / "family.db", blob_dir=Path(td) / "blob",
+            max_file_mb=100, photo_captions=False,
+            models=config.Models(chat="c", extract="e", embed="m", vision="v"),
+        )
+        buf = io.StringIO()
+        try:
+            raise RuntimeError(f"boom {secret}")
+        except RuntimeError as e:
+            with contextlib.redirect_stderr(buf):
+                ingest._log_failure(cfg, "index failed: file 1 run 1", e)
+        stderr_text = buf.getvalue()
+        assert "RuntimeError" in stderr_text  # classified
+        assert secret not in stderr_text  # raw content redacted
+        diag = (Path(td) / "diagnostics.log").read_text(encoding="utf-8")
+        assert secret in diag  # protected local channel keeps the detail
+
+
 def main() -> None:
     check_dep_imports()
     check_sqlite_vec_roundtrip()
@@ -446,6 +501,8 @@ def main() -> None:
     check_ingest_flow()
     check_retrieve_and_chat()
     check_backup_restore()
+    check_client_hardening()
+    check_error_log_redaction()
     print("selftest: all checks passed")
 
 
