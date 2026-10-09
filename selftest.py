@@ -361,6 +361,41 @@ def check_retrieve_and_chat() -> None:
     except RuntimeError:
         pass
 
+    # CI scenario 5 (graph scoping): only CONFIRMED relations on QUERYABLE runs expand;
+    # staging/removed-run relations and pending relations never enter answers
+    e_elec = conn.execute("INSERT INTO entities(name, type, canonical) VALUES('Electricity', 'other', 'electricity')").lastrowid
+    e_prov = conn.execute("INSERT INTO entities(name, type, canonical) VALUES('Provider', 'org', 'provider')").lastrowid
+    e_land = conn.execute("INSERT INTO entities(name, type, canonical) VALUES('Landlord', 'person', 'landlord')").lastrowid
+    e_secr = conn.execute("INSERT INTO entities(name, type, canonical) VALUES('Secret', 'other', 'secret')").lastrowid
+    cur = conn.execute("INSERT INTO chunks(run_id, seq, text, page, kind) VALUES(?,?,?,?, 'body')", (run_id, 2, "secret note", 3))
+    cid_secret = cur.lastrowid
+    cur = conn.execute(
+        "INSERT INTO index_runs(version_id, generation_id, state) VALUES(?,?, 'embedded')", (version_id, gen)
+    )
+    run_ghost = cur.lastrowid
+    cur = conn.execute("INSERT INTO chunks(run_id, seq, text, page, kind) VALUES(?,?,?,?, 'body')", (run_ghost, 0, "landlord note", 1))
+    cid_land = cur.lastrowid
+    conn.executemany(
+        "INSERT INTO chunk_entities(chunk_id, entity_id) VALUES(?,?)",
+        [(chunk_ids[0], e_elec), (chunk_ids[1], e_prov), (cid_land, e_land), (cid_secret, e_secr)],
+    )
+    conn.executemany(
+        "INSERT INTO relations(src, dst, rel, run_id, evidence_chunk_ids, quote, status) "
+        "VALUES(?,?,?,?,?,?, 'confirmed')",
+        [
+            (e_elec, e_prov, "related", run_id, json.dumps([chunk_ids[1]]), "", ),
+            (e_elec, e_land, "related", run_ghost, json.dumps([cid_land]), "", ),  # run not queryable
+            (e_elec, e_secr, "related", run_id, json.dumps([cid_secret]), "", ),  # pending would exclude
+        ],
+    )
+    # fix the pending one explicitly (executemany inserted all as confirmed)
+    conn.execute("UPDATE relations SET status='pending' WHERE dst=?", (e_secr,))
+    conn.commit()
+    expanded = retrieve._graph_chunks(conn, [chunk_ids[0]])
+    assert chunk_ids[1] in expanded, "confirmed relation on a queryable run must expand"
+    assert cid_land not in expanded, "relation on a non-queryable run must not expand"
+    assert cid_secret not in expanded, "pending relation must not expand"
+
     # prompt contract: citations present; document content is data, not instructions
     msgs = chat.build_prompt("what is the bill?", hits)
     assert "DATA" in msgs[0]["content"] and "instructions" in msgs[0]["content"]
@@ -493,6 +528,124 @@ def check_error_log_redaction() -> None:
         assert secret in diag  # protected local channel keeps the detail
 
 
+def check_extract() -> None:
+    """Phase 2 evidence contract: chunk-id validation, quote verification, merge
+    candidates never auto-merged, corrections as override layer — model-free."""
+    import json
+    import re
+    import tempfile
+    from pathlib import Path
+
+    import config
+    import db
+    import extract
+    import ingest
+
+    fake_cfg = dict(
+        max_file_mb=100,
+        photo_captions=False,
+        models=config.Models(chat="q", extract="fake-extract", embed="fake-embed", vision="v"),
+    )
+    fake_embed = lambda model, texts: [[0.25] * 4 for _ in texts]
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        src = root / "src"
+        src.mkdir()
+        cfg = config.Config(source_dirs=(src,), db_path=root / "family.db", blob_dir=root / "blob", **fake_cfg)
+        conn = db.connect(str(cfg.db_path))
+        db.init_db(conn, dims=4, embed_model="fake-embed", embed_digest="deadbeef")
+        (src / "a.txt").write_text("City Power Co sent a bill to Alice Smith for 142 dollars on 2026-08-01.", encoding="utf-8")
+        (src / "b.txt").write_text("Alice Smith renewed the SafeHome policy for the house on Maple Street.", encoding="utf-8")
+        ingest.scan(conn, cfg, embed_fn=fake_embed, dims=4, digest="deadbeef")
+        runs = [r["id"] for r in conn.execute("SELECT id FROM index_runs ORDER BY id")]
+        assert len(runs) == 2
+        run_a, run_b = runs
+
+        chunks_a = conn.execute("SELECT id, text FROM chunks WHERE run_id=? ORDER BY seq", (run_a,)).fetchall()
+        cid_a = chunks_a[0]["id"]
+        chunks_b = conn.execute("SELECT id, text FROM chunks WHERE run_id=? ORDER BY seq", (run_b,)).fetchall()
+        cid_b = chunks_b[0]["id"]
+
+        responses = {
+            run_a: {
+                "entities": [
+                    {"name": "City Power Co", "type": "vendor", "attrs": {}, "chunk_ids": [cid_a]},
+                    {"name": "Alice Smith", "type": "person", "attrs": {}, "chunk_ids": [cid_a]},
+                    {"name": "Ghost", "type": "person", "attrs": {}, "chunk_ids": [99999]},  # bogus chunk id
+                    {"name": "Not In Text", "type": "person", "attrs": {}, "chunk_ids": [cid_a]},  # name not in chunk
+                ],
+                "relations": [
+                    {"source": "City Power Co", "target": "Alice Smith", "relation": "bills",
+                     "quote": "sent a bill to Alice Smith", "chunk_ids": [cid_a]},  # verbatim -> verified
+                    {"source": "City Power Co", "target": "Alice Smith", "relation": "insures",
+                     "quote": "flood covered", "chunk_ids": [cid_a]},  # wrong quote -> unverified, still pending
+                    {"source": "City Power Co", "target": "Ghost Town", "relation": "bills",
+                     "quote": "", "chunk_ids": [cid_a]},  # unknown target -> skipped
+                ],
+                "transactions": [
+                    {"date": "2026-08-01", "amount_minor": 14200, "scale": 100, "merchant": "City Power Co",
+                     "kind": "consumption", "chunk_ids": [cid_a]},
+                    {"date": "2026-08-01", "amount_minor": 100, "scale": 7, "chunk_ids": [cid_a]},  # bad scale
+                    {"date": "not-a-date", "amount_minor": 100, "scale": 100, "chunk_ids": [cid_a]},  # bad date
+                ],
+            },
+            run_b: {
+                "entities": [{"name": "Alice Smith", "type": "person", "attrs": {}, "chunk_ids": [cid_b]}],
+                "relations": [],
+                "transactions": [],
+            },
+        }
+
+        def fake_extract_fn(model, messages):
+            ids = [int(x) for x in re.findall(r"\[(\d+)\]", messages[-1]["content"])]
+            run = conn.execute("SELECT run_id FROM chunks WHERE id=?", (ids[0],)).fetchone()["run_id"]
+            return json.dumps(responses[run])
+
+        assert extract.extract_all(conn, cfg, extract_fn=fake_extract_fn) == 2
+
+        # evidence validation: bogus/unverifiable entities dropped; valid ones landed pending
+        names = {r["name"] for r in conn.execute("SELECT name FROM entities")}
+        assert names == {"City Power Co", "Alice Smith"}
+        assert conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0] == 3  # Alice twice (different runs)
+        # same name across runs -> merge candidate, NEVER merged
+        cands = conn.execute("SELECT * FROM entity_merge_candidates").fetchall()
+        assert len(cands) == 1 and cands[0]["status"] == "pending"
+        # relations: verified + unverified kept, unknown-target skipped
+        rels = conn.execute("SELECT quote_verified, status FROM relations ORDER BY id").fetchall()
+        assert [tuple(r) for r in rels] == [(1, "pending"), (0, "pending")]
+        # transactions: only the valid one
+        assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 1
+        # run states
+        assert all(
+            r["state"] == "extracted" for r in conn.execute("SELECT state FROM index_runs")
+        )
+
+        # corrections are an override layer, and re-extraction must not overwrite them
+        alice_ids = [r["id"] for r in conn.execute("SELECT id FROM entities WHERE name='Alice Smith'")]
+        conn.execute(
+            "INSERT INTO entity_corrections(entity_id, new_name, note, by) VALUES(?,?,?, 'human')",
+            (alice_ids[0], "Alice Zhang", "married name"),
+        )
+        conn.commit()
+        overrides = extract.corrected_entities(conn)
+        assert overrides[alice_ids[0]]["new_name"] == "Alice Zhang"
+
+        # failing extraction marks the run, old index and existing data untouched
+        (src / "c.txt").write_text("another note", encoding="utf-8")
+        ingest.scan(conn, cfg, embed_fn=fake_embed, dims=4, digest="deadbeef")
+
+        def failing_extract_fn(model, messages):
+            raise RuntimeError("simulated extraction outage")
+
+        extract.extract_all(conn, cfg, extract_fn=failing_extract_fn)
+        assert conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0] == 3  # unchanged
+        assert conn.execute(
+            "SELECT COUNT(*) FROM index_runs WHERE state='extract_failed'"
+        ).fetchone()[0] == 1
+        conn.close()
+
+
 def main() -> None:
     check_dep_imports()
     check_sqlite_vec_roundtrip()
@@ -503,6 +656,7 @@ def main() -> None:
     check_backup_restore()
     check_client_hardening()
     check_error_log_redaction()
+    check_extract()
     print("selftest: all checks passed")
 
 
