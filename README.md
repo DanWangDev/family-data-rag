@@ -14,6 +14,33 @@ The new direction is to migrate to Azure to address local compute, vector storag
 - [Candidate work and acceptance gates (Chinese)](docs/architecture/azure-migration-backlog.zh-CN.md)
 - [Editable architecture diagrams: draw.io / Excalidraw](docs/architecture/README.md)
 
+The design addresses three constraints: explicitly decide whether cloud services may process sensitive plaintext; control the cost of correct answers through OCR quality, retrieval, evidence selection, and deterministic calculations; and retain exportable originals, normalized data, and human corrections so indexes can be rebuilt on another platform.
+
+The backlog contains **26 candidate tasks, AZ-001 through AZ-026**, covering trust and residency, quality and cost baselines, provider interfaces, data migration, private networking and identity, document permissions, OCR / retrieval, backup and recovery, and exit / rollback drills. Dependencies and acceptance gates are recorded in the linked backlog. Unchecked tasks are not implemented, and service choices, budgets, and quality thresholds remain subject to evaluation.
+
+### Azure network and managed-service boundaries
+
+The proposed path is family devices / NAS → VPN → internal application integrated with a VNet → Private Endpoints → Azure managed services. **Private Endpoints reside in the VNet; managed services still run under Microsoft. Private connectivity does not prevent the provider from processing plaintext.** Public-access restrictions, outbound controls, identity, private DNS, and authorization in the diagram still require implementation and verification.
+
+![Azure network and managed-service boundaries — proposed, not deployed](docs/architecture/01-network-boundaries.png)
+
+### Service domains and portability boundaries
+
+Logical domains cover access and authorization, documents and evidence, and retrieval and answers. Originals and normalized data remain authoritative; vectors and full-text indexes are rebuildable. Provider adapters centralize Azure calls. These domains do not imply separate subnets or microservices; the initial deployment can use one API and one worker.
+
+![Service domains and portability boundaries — proposed, not implemented](docs/architecture/02-service-domains.png)
+
+### Editable architecture diagrams
+
+| Format | File | Contents |
+| --- | --- | --- |
+| draw.io / diagrams.net | [Complete architecture](docs/architecture/azure-architecture.drawio) | Two editable pages |
+| Excalidraw | [Network and managed-service boundaries](docs/architecture/01-network-boundaries.excalidraw) | Networking, Private Endpoints, and Microsoft's managed services |
+| Excalidraw | [Service domains](docs/architecture/02-service-domains.excalidraw) | Responsibilities, data ownership, and provider adapters |
+| SVG | [Network](docs/architecture/01-network-boundaries.svg) · [Service domains](docs/architecture/02-service-domains.svg) | Vector references |
+
+Drag a native file into its editor or open it as a local file. Nodes, text, and connectors are editable; later manual edits do not synchronize between formats. [Import, initial generation, and validation notes](docs/architecture/README.md) are included in the repository.
+
 ## Development status
 
 This README describes the intended design and distinguishes current code from planned capabilities. Status checked on 2026-10-09 against primary workspace commit `fca6229` and its then-uncommitted changes; Claude Code was developing in parallel. Phase 1 foundation code had been committed, with knowledge graph extraction next. Acceptance testing with real materials and evaluation of model quality are separate activities.
@@ -31,7 +58,7 @@ This README describes the intended design and distinguishes current code from pl
 
 Passing self-tests only means that the existing synthetic checks passed. See [bench.md](bench.md) for environment measurements and the [security review](docs/security-review.md) for credential scan results and unresolved issues.
 
-## Architecture
+## Local architecture reference
 
 Solid lines indicate existing foundation implementations; dashed lines indicate planned connections. The security boundary is a target that must be implemented and verified.
 
