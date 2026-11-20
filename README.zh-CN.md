@@ -4,7 +4,42 @@
 
 面向家庭文档、照片、账单与合同的本地数据系统：保存原始材料，提供可追溯的检索和问答，再逐步增加知识关系、支出对账与消费周期分析。
 
-设计目标是本机处理：Ollama 提供模型推理，SQLite 保存数据和索引，NAS 作为文件来源。安装依赖与下载模型需要联网。**本地运行边界仍需配置和验证，不能仅凭使用 Ollama 就认为数据不会外传。**
+当前实现以本机处理为基础：Ollama 提供模型推理，SQLite 保存数据和索引，NAS 作为文件来源。安装依赖与下载模型需要联网。**本地运行边界仍需配置和验证，不能仅凭使用 Ollama 就认为数据不会外传。**
+
+## Azure 迁移规划（2026-11-20）
+
+项目的新方向是迁移到 Azure，缓解本地算力、向量存储与 OCR 质量问题，同时保留安全边界、成本控制和未来迁出的能力。目前仅完成规划文档与架构图，尚未部署 Azure 资源或迁移家庭资料；下方本地架构及历史开发状态继续作为现有实现的参考。
+
+- [迁移设计与决策记录](docs/architecture/azure-migration-plan.zh-CN.md)
+- [候选工作清单与验收门槛](docs/architecture/azure-migration-backlog.zh-CN.md)
+- [可编辑架构图：draw.io / Excalidraw](docs/architecture/README.md)
+
+迁移设计围绕三个约束展开：先明确敏感资料是否允许云服务商处理明文；通过更好的 OCR、检索、证据选择和确定性统计控制每个正确答案的成本；保留可导出的原文件、标准化资料和人工纠正，使向量与搜索索引能够在其他环境重建。
+
+后续工作已整理为 **AZ-001～AZ-026 共 26 项候选任务**，覆盖信任与地域、质量与费用基线、提供商接口、数据迁移、私网与身份、文档权限、OCR / 检索优化、备份恢复和迁出 / 回退。各阶段依赖与验收门槛见上方工作清单；未勾选项目尚未实施，服务选型、预算和质量阈值仍需评估。
+
+### Azure 网络与托管服务边界
+
+建议路径为家庭设备 / NAS → VPN → VNet 集成的内部应用 → Private Endpoint → Azure 托管服务。**Private Endpoint 位于 VNet 内，托管服务仍由微软运行；私网连接不代表服务商无法处理明文。** 图中的公网关闭、出站限制、身份、私有 DNS 和权限策略均待实施和验证。
+
+![Azure 网络与托管服务边界（规划，未部署）](docs/architecture/01-network-boundaries.png)
+
+### 业务服务域与可迁移边界
+
+业务域按访问与权限、文档与证据、检索与问答划分；原始 / 标准化资料作为权威数据保存，向量与全文索引作为可重建数据。供应商适配层集中处理 Azure 调用。逻辑业务域不等于子网或独立微服务，初期可采用一个 API 加一个 Worker。
+
+![业务服务域与可迁移边界（规划，未实施）](docs/architecture/02-service-domains.png)
+
+### 可编辑架构图
+
+| 格式 | 文件 | 内容 |
+| --- | --- | --- |
+| draw.io / diagrams.net | [完整架构图](docs/architecture/azure-architecture.drawio) | 两个可编辑页面 |
+| Excalidraw | [网络与托管边界](docs/architecture/01-network-boundaries.excalidraw) | 网络、Private Endpoint 与微软托管服务域 |
+| Excalidraw | [业务服务域](docs/architecture/02-service-domains.excalidraw) | 职责、数据所有权与供应商适配层 |
+| SVG | [网络图](docs/architecture/01-network-boundaries.svg) · [业务域图](docs/architecture/02-service-domains.svg) | 矢量参考 |
+
+将原生文件拖入对应编辑器或使用打开本地文件功能。节点、文字和连线可编辑；两种格式的后续手工修改不会自动同步。[导入、初版生成和校验说明](docs/architecture/README.md)也包含在仓库中。
 
 ## 开发状态
 
@@ -23,7 +58,7 @@
 
 自检通过只表示现有合成样本检查通过。环境测量见 [基准记录](bench.zh-CN.md)；凭据检查结果和未关闭问题见 [安全审查记录](docs/security-review.zh-CN.md)。
 
-## 整体架构
+## 本地架构参考
 
 实线表示当前已有基础实现；虚线表示后续规划连接。安全边界是需要实现并验证的目标。
 
