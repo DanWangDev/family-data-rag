@@ -4,7 +4,15 @@
 
 A local data system for family documents, photos, bills, and contracts: preserve original materials, provide traceable search and question answering, and gradually add knowledge relationships, spending reconciliation, and consumption-cycle analysis.
 
-The design targets local processing: Ollama runs model inference, SQLite stores data and indexes, and a NAS provides source files. Installing dependencies and downloading models requires internet access. **The local processing boundary still needs configuration and verification; using Ollama alone does not guarantee that data stays on the machine.**
+The current implementation is based on local processing: Ollama runs model inference, SQLite stores data and indexes, and a NAS provides source files. Installing dependencies and downloading models requires internet access. **The local processing boundary still needs configuration and verification; using Ollama alone does not guarantee that data stays on the machine.**
+
+## Azure migration planning (2026-11-20)
+
+The new direction is to migrate to Azure to address local compute, vector storage, and OCR quality constraints while preserving data security, cost control, and future portability. This work currently consists of planning documents and diagrams; no Azure resources have been deployed and no family data has been migrated. The local architecture and historical development status below remain references for the existing implementation.
+
+- [Migration design and decision record (Chinese)](docs/architecture/azure-migration-plan.zh-CN.md)
+- [Candidate work and acceptance gates (Chinese)](docs/architecture/azure-migration-backlog.zh-CN.md)
+- [Editable architecture diagrams: draw.io / Excalidraw](docs/architecture/README.md)
 
 ## Development status
 
